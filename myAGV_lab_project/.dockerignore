@@ -1,0 +1,38 @@
+# .dockerignore — files excluded from the Docker build context
+
+# Virtual environment (large, rebuilt inside container)
+../.venv/
+.venv/
+
+# Python cache
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/*.pyd
+.pytest_cache/
+*.egg-info/
+
+# Secrets — NEVER bake these into the image
+.env
+**/.env
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Docker itself
+Dockerfile*
+docker-compose*.yml
+.dockerignore
+
+# Documentation (not needed at runtime)
+lab_guide/
+
+# Generated map images (yaml kept; png can be large)
+maps/*.png

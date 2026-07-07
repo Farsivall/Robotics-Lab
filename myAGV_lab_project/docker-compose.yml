@@ -1,0 +1,95 @@
+# docker-compose.yml
+# myAGV Summer School Lab
+#
+# Services:
+#   sim        — simulation mode (no robot, no ROS2, lightweight)
+#   test       — run the full pytest suite inside the sim image
+#   myagv_slam — real myAGV 2023, matches the on-robot container name
+#
+# Usage:
+#   docker compose run --rm sim                            # interactive sim shell
+#   docker compose run --rm sim python3 -m myagv_lab.phase2_nav.nav_node --sim
+#   docker compose run --rm test                           # run all tests
+#   docker compose run --rm myagv_slam bash                # real-robot shell
+#
+# Environment variables:
+#   Copy .env.example to .env and fill in your keys.
+#   Keys are injected at runtime — never baked into the image.
+
+x-common-env: &common-env
+  STUDENT_ID:          ${STUDENT_ID:-}
+  DEEPSEEK_API_KEY:    ${DEEPSEEK_API_KEY:-}
+  LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
+  LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
+  LANGFUSE_BASE_URL:   ${LANGFUSE_BASE_URL:-https://cloud.langfuse.com}
+
+x-display: &display
+  DISPLAY:          ${DISPLAY:-:0}
+  QT_X11_NO_MITSHM: "1"
+  MPLBACKEND:       ${MPLBACKEND:-TkAgg}
+
+services:
+
+  # ── Simulation (no robot, no ROS2) ──────────────────────────────────────────
+  sim:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: sim
+    image: myagv-lab:sim
+    container_name: myagv_sim
+    environment:
+      <<: [*common-env, *display]
+      MYAGV_USE_SIM: "1"
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix:ro        # X11 for matplotlib GUI
+      - .:/ws/src/myAGV_lab_project             # live edits on host visible in container
+      - ./maps:/ws/src/myAGV_lab_project/maps   # persist maps
+    stdin_open: true
+    tty: true
+    network_mode: host
+
+  # ── Test runner ──────────────────────────────────────────────────────────────
+  test:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: sim
+    image: myagv-lab:sim
+    container_name: myagv_test
+    environment:
+      MYAGV_USE_SIM: "1"
+      MPLBACKEND: Agg                             # headless — no display needed
+    volumes:
+      - .:/ws/src/myAGV_lab_project
+    working_dir: /ws/src/myAGV_lab_project
+    command: >
+      bash -c "PYTHONPATH='' python3 -m pytest tests/test_all_phases.py -v"
+    network_mode: none                            # tests are fully offline
+
+  # ── Real robot — matches the on-board container name (myagv_slam) ────────────
+  myagv_slam:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: robot
+      args:
+        ROS_DISTRO: ${ROS_DISTRO:-galactic}
+        UBUNTU_VERSION: "20.04"
+    image: myagv-lab:robot
+    container_name: myagv_slam
+    environment:
+      <<: [*common-env, *display]
+      MYAGV_USE_SIM: "0"
+      ROS_DISTRO:       ${ROS_DISTRO:-galactic}
+      ROS_DOMAIN_ID:    ${ROS_DOMAIN_ID:-0}
+      RMW_IMPLEMENTATION: rmw_fastrtps_cpp
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix:ro
+      - .:/ws/src/myAGV_lab_project
+      - ./maps:/ws/src/myAGV_lab_project/maps
+      - /dev:/dev                                 # USB serial access to cobot arm
+    privileged: true
+    network_mode: host                            # share ROS2 DDS with the robot
+    stdin_open: true
+    tty: true
