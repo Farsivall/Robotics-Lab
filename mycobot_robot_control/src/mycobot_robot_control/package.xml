@@ -10,6 +10,7 @@
 
   <exec_depend>mycobot_client_2</exec_depend>
   <exec_depend>mycobot_msgs_2</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
   <exec_depend>rclpy</exec_depend>
   <exec_depend>std_srvs</exec_depend>
 

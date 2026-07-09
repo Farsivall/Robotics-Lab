@@ -9,15 +9,18 @@ Sequence: home -> open -> approach -> descend -> partial close -> lift ->
 
 Usage: python pick_flow.py [PX PY ROT [GRASP_Z PLACE_Z GRIP_VAL SPEED]]
        defaults: 0.18 0 90 0.02 0.06 35 25
+       omit PX/PY to wait for /block_position (geometry_msgs/PointStamped) from vision
 Env:   ROBOT_IP overrides target robot (default 192.168.123.50)
 """
 import os, subprocess, sys, time
 import numpy as np
 import rclpy
+from geometry_msgs.msg import PointStamped
 from mycobot_client_2.ik import CobotIK
 from mycobot_msgs_2.msg import MycobotAngles, MycobotSetAngles
 
 a = sys.argv[1:]
+USE_VISION = len(a) < 2
 PX = float(a[0]) if len(a) > 0 else 0.18
 PY = float(a[1]) if len(a) > 1 else 0.0
 ROT = float(a[2]) if len(a) > 2 else 90.0
@@ -37,8 +40,15 @@ if GV < 25: print('GRIP_VAL < 25 risks stall-current brownout'); raise SystemExi
 
 rclpy.init(); node = CobotIK(visualize=False)
 real = {'a': None}
+target = {'x': None, 'y': None}
+
+def block_callback(msg):
+    target['x'] = msg.point.x
+    target['y'] = msg.point.y
+
 node.create_subscription(MycobotAngles, '/mycobot/angles_real',
     lambda m: real.__setitem__('a', np.array([m.joint_1, m.joint_2, m.joint_3, m.joint_4, m.joint_5, m.joint_6], float)), 10)
+node.create_subscription(PointStamped, '/block_position', block_callback, 10)
 
 def fresh(t=4.0):
     real['a'] = None; t0 = time.time()
@@ -80,6 +90,27 @@ def grip(v, sp):
     if len(boots) == 2 and boots[0] != boots[1]: print('grip: PI REBOOTED'); return False
     if fresh(20) is None: print('grip: comms did not come back'); return False
     return True
+
+def wait_for_vision(timeout=120.0):
+    print('waiting for /block_position from vision...')
+    t0 = time.time()
+    while target['x'] is None:
+        rclpy.spin_once(node, timeout_sec=0.1)
+        if time.time() - t0 > timeout:
+            print('vision: TIMEOUT waiting for /block_position')
+            return None, None
+    px, py = target['x'], target['y']
+    print(f'vision: block at PX={px:.3f} PY={py:.3f}')
+    return px, py
+
+def approach_pick():
+    if USE_VISION:
+        px, py = wait_for_vision()
+        if px is None:
+            return False
+    else:
+        px, py = PX, PY
+    return approach(px, py, GZ + APPR)
 
 def approach(x, y, z):
     ik = node.calculate_ik(np.array([x, y, z]), DOWN, 'gripper', 1e-5, 0.3, 0.02, False, 4000, False)
@@ -135,7 +166,7 @@ def rotate(delta):
 steps = [
     ('home',          lambda: home()),
     ('open',          lambda: grip(100, 40)),
-    ('approach',      lambda: approach(PX, PY, GZ + APPR)),
+    ('approach',      approach_pick),
     ('descend',       lambda: move_z(GZ, 15)),
     ('grip',          lambda: grip(GV, 15)),
     ('lift',          lambda: move_z(LIFT, SP)),
