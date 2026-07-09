@@ -1,0 +1,7 @@
+build/
+install/
+log/
+reports/
+provision/*.tar
+**/__pycache__/
+*.py[cod]
