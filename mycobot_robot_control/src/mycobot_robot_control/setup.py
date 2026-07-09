@@ -26,6 +26,7 @@ setup(
     scripts=[
         "mycobot_robot_control/cam_to_coord.py",
         "mycobot_robot_control/go_home.py",
+        "mycobot_robot_control/homography_transform.py",
         "mycobot_robot_control/move_to_pose.py",
         "mycobot_robot_control/move_z.py",
         "mycobot_robot_control/pick_flow.py",

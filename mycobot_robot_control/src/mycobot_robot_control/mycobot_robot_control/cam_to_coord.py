@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Person 2: detect block in webcam and publish table (x, y) for pick_flow.
+"""Person 2+3: detect block, apply homography, publish table (x, y) for pick_flow.
 
 Publishes geometry_msgs/PointStamped on /block_position — the topic
 pick_flow.py waits for when run without PX/PY args.
 
-Person 3 later replaces pixel_to_table() with real homography/calibration.
-Until then, a simple linear map is used (tune CAMERA_* / TABLE_* below).
+Pipeline:
+  webcam -> background subtract -> pixel (cx, cy)
+        -> homography_transform.pixel_to_meters -> (x, y) meters
+        -> /block_position -> pick_flow.py
 
 Usage:
   python cam_to_coord.py              # live detect + publish
@@ -16,7 +18,9 @@ Env:
   ROS_DOMAIN_ID should match pick_flow (usually 10).
 """
 import argparse
+import sys
 import time
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -24,13 +28,9 @@ import rclpy
 from geometry_msgs.msg import PointStamped
 from rclpy.node import Node
 
-# --- placeholder calibration (Person 3 replaces pixel_to_table) ---
-# Map image pixel (u,v) into approximate table meters (x forward, y left).
-# Defaults assume camera looks down at a region in front of the robot.
-CAMERA_WIDTH = 640.0
-CAMERA_HEIGHT = 480.0
-TABLE_X_MIN, TABLE_X_MAX = 0.10, 0.26   # meters forward from base
-TABLE_Y_MIN, TABLE_Y_MAX = -0.10, 0.10  # meters left(+)/right(-)
+# Same-folder import when run as a script from Downloads / source tree
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from homography_transform import pixel_to_meters
 
 
 def get_background(cap, num_frames=30):
@@ -61,21 +61,17 @@ def detect_block(frame, background, threshold=30):
     return cx, cy
 
 
-def pixel_to_table(cx, cy, frame_w, frame_h):
-    """Placeholder pixel -> table meters. Person 3: replace with homography."""
-    u = cx / max(frame_w, 1.0)
-    v = cy / max(frame_h, 1.0)
-    # image top ~ farther from robot (larger x), image left ~ +y
-    x = TABLE_X_MAX - v * (TABLE_X_MAX - TABLE_X_MIN)
-    y = TABLE_Y_MAX - u * (TABLE_Y_MAX - TABLE_Y_MIN)
-    return float(x), float(y)
+def pixel_to_table(cx, cy, frame_w=None, frame_h=None):
+    """Pixel centroid -> table meters (x forward, y lateral) via Person 3 homography."""
+    del frame_w, frame_h
+    return pixel_to_meters(cx, cy)
 
 
 class BlockPublisher(Node):
     def __init__(self):
         super().__init__("cam_to_coord")
         self.pub = self.create_publisher(PointStamped, "/block_position", 10)
-        self.get_logger().info("publishing detections on /block_position")
+        self.get_logger().info("publishing detections on /block_position (homography)")
 
     def publish_xy(self, x, y):
         msg = PointStamped()
@@ -121,16 +117,14 @@ def main():
                 print("Failed to capture frame")
                 break
 
-            h, w = frame.shape[:2]
             result = detect_block(frame, background, threshold=args.threshold)
             if result is None:
                 node.get_logger().info("no block detected", throttle_duration_sec=2.0)
             else:
                 cx, cy = result
-                x, y = pixel_to_table(cx, cy, w, h)
+                x, y = pixel_to_table(cx, cy)
                 node.publish_xy(x, y)
                 published = True
-                # overlay for local debug
                 cv2.circle(frame, (int(cx), int(cy)), 8, (0, 255, 0), 2)
                 cv2.putText(
                     frame, f"({x:.3f}, {y:.3f}) m",
