@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Person 2+3: detect block, apply homography, publish table (x, y) for pick_flow.
+"""Person 2+3: detect red block, apply homography, publish table (x, y) for pick_flow.
 
 Publishes geometry_msgs/PointStamped on /block_position — the topic
 pick_flow.py waits for when run without PX/PY args.
 
 Pipeline:
-  webcam -> background subtract -> pixel (cx, cy)
+  webcam -> HSV red mask -> largest blob centroid (cx, cy)
         -> homography_transform.pixel_to_meters -> (x, y) meters
         -> /block_position -> pick_flow.py
 
@@ -13,6 +13,7 @@ Usage:
   python cam_to_coord.py              # live detect + publish
   python cam_to_coord.py --once       # one detection then exit
   python cam_to_coord.py --camera 1   # non-default webcam index
+  python cam_to_coord.py --color red  # red (default) | green | blue
 
 Env:
   ROS_DOMAIN_ID should match pick_flow (usually 10).
@@ -20,6 +21,7 @@ Env:
 import argparse
 import sys
 import time
+from collections import deque
 from pathlib import Path
 
 import cv2
@@ -32,38 +34,66 @@ from rclpy.node import Node
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from homography_transform import pixel_to_meters
 
+# Match Person 3 calibration image size (px points go up to ~1174 x 647)
+CAM_WIDTH = 1280
+CAM_HEIGHT = 720
 
-def get_background(cap, num_frames=30):
-    frames = []
-    for _ in range(num_frames):
-        ret, frame = cap.read()
-        if ret:
-            frames.append(frame)
-        time.sleep(0.03)
-    if not frames:
+# HSV ranges (OpenCV H: 0-179). Red wraps around 0.
+COLOR_HSV = {
+    "red": [
+        (np.array([0, 80, 60]), np.array([10, 255, 255])),
+        (np.array([160, 80, 60]), np.array([179, 255, 255])),
+    ],
+    "green": [
+        (np.array([40, 60, 40]), np.array([85, 255, 255])),
+    ],
+    "blue": [
+        (np.array([95, 60, 40]), np.array([130, 255, 255])),
+    ],
+}
+
+MIN_AREA_PX = 400          # ignore tiny noise blobs
+SMOOTH_N = 5               # average last N centroids for stable publish
+
+
+def color_mask(frame_bgr, color="red"):
+    """Return binary mask for the chosen block color."""
+    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+    ranges = COLOR_HSV[color]
+    mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
+    for lo, hi in ranges:
+        mask = cv2.bitwise_or(mask, cv2.inRange(hsv, lo, hi))
+
+    # Clean speckles, fill small holes
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=2)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    return mask
+
+
+def detect_block(frame, color="red", min_area=MIN_AREA_PX):
+    """Detect colored block; return (cx, cy, area, contour) or None."""
+    mask = color_mask(frame, color=color)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
         return None
-    return np.median(frames, axis=0).astype(np.uint8)
 
+    # Largest contour by area = the block
+    contour = max(contours, key=cv2.contourArea)
+    area = cv2.contourArea(contour)
+    if area < min_area:
+        return None
 
-def detect_block(frame, background, threshold=30):
-    diff = cv2.absdiff(frame, background)
-    gray_diff = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
-    _, mask = cv2.threshold(gray_diff, threshold, 255, cv2.THRESH_BINARY)
-
-    mask = cv2.erode(mask, None, iterations=2)
-    mask = cv2.dilate(mask, None, iterations=2)
-
-    M = cv2.moments(mask, binaryImage=True)
+    M = cv2.moments(contour)
     if M["m00"] == 0:
         return None
     cx = M["m10"] / M["m00"]
     cy = M["m01"] / M["m00"]
-    return cx, cy
+    return cx, cy, area, contour, mask
 
 
-def pixel_to_table(cx, cy, frame_w=None, frame_h=None):
+def pixel_to_table(cx, cy):
     """Pixel centroid -> table meters (x forward, y lateral) via Person 3 homography."""
-    del frame_w, frame_h
     return pixel_to_meters(cx, cy)
 
 
@@ -71,7 +101,7 @@ class BlockPublisher(Node):
     def __init__(self):
         super().__init__("cam_to_coord")
         self.pub = self.create_publisher(PointStamped, "/block_position", 10)
-        self.get_logger().info("publishing detections on /block_position (homography)")
+        self.get_logger().info("publishing detections on /block_position (HSV + homography)")
 
     def publish_xy(self, x, y):
         msg = PointStamped()
@@ -85,11 +115,15 @@ class BlockPublisher(Node):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Detect block and publish /block_position")
+    parser = argparse.ArgumentParser(description="Detect colored block and publish /block_position")
     parser.add_argument("--camera", type=int, default=0, help="webcam index")
-    parser.add_argument("--threshold", type=int, default=30, help="bg-sub threshold")
+    parser.add_argument("--color", choices=sorted(COLOR_HSV.keys()), default="red",
+                        help="block color to detect (default: red)")
+    parser.add_argument("--min-area", type=int, default=MIN_AREA_PX, help="min contour area px")
     parser.add_argument("--once", action="store_true", help="publish one detection then exit")
-    parser.add_argument("--rate", type=float, default=2.0, help="publish rate Hz when looping")
+    parser.add_argument("--rate", type=float, default=5.0, help="loop rate Hz")
+    parser.add_argument("--width", type=int, default=CAM_WIDTH, help="capture width (match calibration)")
+    parser.add_argument("--height", type=int, default=CAM_HEIGHT, help="capture height")
     args = parser.parse_args()
 
     cap = cv2.VideoCapture(args.camera)
@@ -97,18 +131,23 @@ def main():
         print(f"Failed to open camera {args.camera}")
         raise SystemExit(1)
 
-    print("Capturing background (clear the table)...")
-    background = get_background(cap, num_frames=30)
-    if background is None:
-        print("Failed to capture background")
-        cap.release()
-        raise SystemExit(1)
-    print("Background ready. Place the block, detecting...")
+    # Force resolution to match homography calibration pixels
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
+    actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    print(f"Camera {args.camera}: {actual_w}x{actual_h}, detecting color={args.color}")
+    if abs(actual_w - args.width) > 40 or abs(actual_h - args.height) > 40:
+        print(f"WARNING: requested {args.width}x{args.height} but got {actual_w}x{actual_h}; "
+              f"homography may be off — recalibrate or pass --width/--height")
+
+    print("Place the red block in view. Press q to quit.")
 
     rclpy.init()
     node = BlockPublisher()
     period = 1.0 / max(args.rate, 0.1)
     published = False
+    recent = deque(maxlen=SMOOTH_N)
 
     try:
         while rclpy.ok():
@@ -117,28 +156,44 @@ def main():
                 print("Failed to capture frame")
                 break
 
-            result = detect_block(frame, background, threshold=args.threshold)
+            result = detect_block(frame, color=args.color, min_area=args.min_area)
             if result is None:
-                node.get_logger().info("no block detected", throttle_duration_sec=2.0)
+                recent.clear()
+                node.get_logger().info(f"no {args.color} block detected", throttle_duration_sec=2.0)
+                display = frame
             else:
-                cx, cy = result
-                x, y = pixel_to_table(cx, cy)
+                cx, cy, area, contour, mask = result
+                recent.append((cx, cy))
+                # Smooth centroid so published pose is less jumpy
+                sx = sum(p[0] for p in recent) / len(recent)
+                sy = sum(p[1] for p in recent) / len(recent)
+                x, y = pixel_to_table(sx, sy)
                 node.publish_xy(x, y)
                 published = True
-                cv2.circle(frame, (int(cx), int(cy)), 8, (0, 255, 0), 2)
-                cv2.putText(
-                    frame, f"({x:.3f}, {y:.3f}) m",
-                    (int(cx) + 10, int(cy) - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1,
-                )
 
-            cv2.imshow("cam_to_coord", frame)
+                display = frame.copy()
+                cv2.drawContours(display, [contour], -1, (0, 255, 0), 2)
+                cv2.circle(display, (int(sx), int(sy)), 8, (0, 255, 0), 2)
+                cv2.putText(
+                    display,
+                    f"{args.color} ({x:.3f}, {y:.3f}) m  area={int(area)}",
+                    (int(sx) + 12, int(sy) - 12),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2,
+                )
+                # Small mask preview (top-left)
+                preview = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+                ph, pw = preview.shape[:2]
+                scale = 160 / max(pw, 1)
+                preview = cv2.resize(preview, (int(pw * scale), int(ph * scale)))
+                display[0:preview.shape[0], 0:preview.shape[1]] = preview
+
+            cv2.imshow("cam_to_coord", display)
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q"):
                 break
 
             rclpy.spin_once(node, timeout_sec=0.0)
-            if args.once and published:
+            if args.once and published and len(recent) >= min(3, SMOOTH_N):
                 break
             time.sleep(period)
     finally:
