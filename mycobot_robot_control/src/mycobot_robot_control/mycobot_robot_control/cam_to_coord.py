@@ -40,6 +40,7 @@ CAM_HEIGHT = 720
 
 # HSV ranges (OpenCV H: 0-179). Red wraps around 0.
 COLOR_HSV = {
+    '''
     "red": [
         (np.array([0, 80, 60]), np.array([10, 255, 255])),
         (np.array([160, 80, 60]), np.array([179, 255, 255])),
@@ -47,6 +48,8 @@ COLOR_HSV = {
     "green": [
         (np.array([40, 60, 40]), np.array([85, 255, 255])),
     ],
+    '''
+    
     "blue": [
         (np.array([95, 60, 40]), np.array([130, 255, 255])),
     ],
