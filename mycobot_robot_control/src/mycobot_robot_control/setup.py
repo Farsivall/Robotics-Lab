@@ -24,6 +24,7 @@ setup(
     description="Student-facing myCobot 280 control scripts, examples, and tutorials.",
     license="Apache-2.0",
     scripts=[
+        "mycobot_robot_control/cam_to_coord.py",
         "mycobot_robot_control/go_home.py",
         "mycobot_robot_control/move_to_pose.py",
         "mycobot_robot_control/move_z.py",
