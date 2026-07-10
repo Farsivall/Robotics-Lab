@@ -243,7 +243,7 @@ def main():
                     status = "PUBLISHING"
                 else:
                     status = f"locking... {len(recent)}/{SMOOTH_N}"
-            else:
+            if result is None:
                 recent.clear()
 
             cv2.putText(
