@@ -18,6 +18,14 @@ import subprocess
 import sys
 import time
 
+# RoboEnv IK dependency (needed even if shell forgot to export PYTHONPATH)
+_ROBO = os.path.expanduser("~/RoboEnv/simulation_and_control")
+if os.path.isdir(_ROBO) and _ROBO not in sys.path:
+    sys.path.insert(0, _ROBO)
+_env_pp = os.environ.get("PYTHONPATH", "")
+if _ROBO not in _env_pp.split(os.pathsep):
+    os.environ["PYTHONPATH"] = _ROBO + (os.pathsep + _env_pp if _env_pp else "")
+
 import numpy as np
 import rclpy
 from geometry_msgs.msg import PointStamped
