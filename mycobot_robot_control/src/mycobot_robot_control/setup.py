@@ -32,6 +32,7 @@ setup(
         "mycobot_robot_control/pick_flow.py",
         "mycobot_robot_control/pick_service.py",
         "mycobot_robot_control/rotate_arm.py",
+        "mycobot_robot_control/sort_blocks.py",
         "mycobot_robot_control/tactile_visualizer.py",
     ],
 )

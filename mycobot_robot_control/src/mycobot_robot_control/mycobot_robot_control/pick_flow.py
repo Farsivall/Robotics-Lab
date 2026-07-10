@@ -18,6 +18,7 @@ import rclpy
 from geometry_msgs.msg import PointStamped
 from mycobot_client_2.ik import CobotIK
 from mycobot_msgs_2.msg import MycobotAngles, MycobotSetAngles
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 
 a = sys.argv[1:]
 USE_VISION = len(a) < 2
@@ -38,6 +39,13 @@ SSH = ['/usr/bin/sshpass', '-p', 'Elephant', 'ssh', '-o', 'StrictHostKeyChecking
        '-o', 'PreferredAuthentications=password', '-o', 'PubkeyAuthentication=no', 'er@' + RIP]
 if GV < 25: print('GRIP_VAL < 25 risks stall-current brownout'); raise SystemExit(2)
 
+# Must match cam_to_coord.py so late subscribe still gets last detection
+BLOCK_QOS = QoSProfile(
+    depth=10,
+    reliability=ReliabilityPolicy.RELIABLE,
+    durability=DurabilityPolicy.TRANSIENT_LOCAL,
+)
+
 rclpy.init(); node = CobotIK(visualize=False)
 real = {'a': None}
 target = {'x': None, 'y': None}
@@ -45,10 +53,12 @@ target = {'x': None, 'y': None}
 def block_callback(msg):
     target['x'] = msg.point.x
     target['y'] = msg.point.y
+    print(f"  (got /block_position x={msg.point.x:.3f} y={msg.point.y:.3f})", flush=True)
 
 node.create_subscription(MycobotAngles, '/mycobot/angles_real',
     lambda m: real.__setitem__('a', np.array([m.joint_1, m.joint_2, m.joint_3, m.joint_4, m.joint_5, m.joint_6], float)), 10)
-node.create_subscription(PointStamped, '/block_position', block_callback, 10)
+node.create_subscription(PointStamped, '/block_position', block_callback, BLOCK_QOS)
+print(f"pick_flow ready | vision={USE_VISION} | ROS_DOMAIN_ID={os.environ.get('ROS_DOMAIN_ID', '0')}")
 
 def fresh(t=4.0):
     real['a'] = None; t0 = time.time()
@@ -93,10 +103,17 @@ def grip(v, sp):
 
 def wait_for_vision(timeout=120.0):
     print('waiting for /block_position from vision...')
+    print('  tip: other terminal must show lines like: PUB /block_position  x=... y=...')
+    print(f'  tip: both terminals need ROS_DOMAIN_ID={os.environ.get("ROS_DOMAIN_ID", "0")}')
     t0 = time.time()
+    last_hb = t0
     while target['x'] is None:
         rclpy.spin_once(node, timeout_sec=0.1)
-        if time.time() - t0 > timeout:
+        now = time.time()
+        if now - last_hb >= 3.0:
+            print(f'  still waiting... {now - t0:.0f}s (is cam_to_coord publishing?)', flush=True)
+            last_hb = now
+        if now - t0 > timeout:
             print('vision: TIMEOUT waiting for /block_position')
             return None, None
     px, py = target['x'], target['y']
@@ -104,12 +121,11 @@ def wait_for_vision(timeout=120.0):
     return px, py
 
 def approach_pick():
-    if USE_VISION:
-        px, py = wait_for_vision()
-        if px is None:
-            return False
-    else:
-        px, py = PX, PY
+    # coords already resolved in 'vision' step when USE_VISION
+    px, py = (PX, PY) if not USE_VISION else (target['x'], target['y'])
+    if px is None or py is None:
+        print('approach: no target coords')
+        return False
     return approach(px, py, GZ + APPR)
 
 def approach(x, y, z):
@@ -163,7 +179,20 @@ def rotate(delta):
             if b is not None and abs(b[0] - j1) < 3: break
     print('rotate: OK'); return True
 
+def vision_step():
+    """Get block pose first (before moving) so hang is obvious and DDS can connect."""
+    if not USE_VISION:
+        print(f'vision: using CLI PX={PX} PY={PY}')
+        return True
+    px, py = wait_for_vision()
+    if px is None:
+        return False
+    # freeze coords for the rest of the cycle (ignore later vision jitter)
+    target['x'], target['y'] = px, py
+    return True
+
 steps = [
+    ('vision',        vision_step),   # wait for camera BEFORE moving the arm
     ('home',          lambda: home()),
     ('open',          lambda: grip(100, 40)),
     ('approach',      approach_pick),
