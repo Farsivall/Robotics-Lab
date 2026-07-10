@@ -192,8 +192,11 @@ def main():
                 break
 
             result = detect_block(frame, color=args.color, min_area=args.min_area)
+            display = frame.copy()
+            status = "no block"
+
             if result is None:
-                display = frame.copy()
+                recent.clear()
                 debug_color = args.color if args.color != "auto" else "blue"
                 dbg = color_mask(frame, debug_color)
                 preview = cv2.cvtColor(dbg, cv2.COLOR_GRAY2BGR)
@@ -203,21 +206,22 @@ def main():
                 )
                 display[0:preview.shape[0], 0:preview.shape[1]] = preview
                 cv2.putText(
-                    display, "no blue block — check mask (top-left)",
+                    display, f"no {debug_color} block — check mask (top-left)",
                     (10, preview.shape[0] + 24),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2,
                 )
             else:
-                cx, cy, area, contour, mask , found_colour = result
+                cx, cy, area, contour, mask, found_colour = result
                 recent.append((cx, cy))
                 sx = sum(p[0] for p in recent) / len(recent)
                 sy = sum(p[1] for p in recent) / len(recent)
                 x, y = pixel_to_meters(sx, sy)
+                draw = DRAW_COLOR.get(found_colour, (0, 255, 0))
 
-                cv2.drawContours(display, [contour], -1, DRAW_COLOR, 2)
+                cv2.drawContours(display, [contour], -1, draw, 2)
                 cv2.circle(display, (int(sx), int(sy)), 10, (0, 255, 0), -1)
                 cv2.putText(
-                    display, f"blue ({x:.3f},{y:.3f})m",
+                    display, f"{found_colour} ({x:.3f},{y:.3f})m",
                     (int(sx) + 12, int(sy) - 12),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2,
                 )
@@ -243,8 +247,6 @@ def main():
                     status = "PUBLISHING"
                 else:
                     status = f"locking... {len(recent)}/{SMOOTH_N}"
-            else:
-                recent.clear()
 
             cv2.putText(
                 display, status, (10, display.shape[0] - 16),
