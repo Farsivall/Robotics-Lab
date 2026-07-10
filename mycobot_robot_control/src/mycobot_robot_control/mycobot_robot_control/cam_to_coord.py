@@ -1,20 +1,19 @@
 #!/usr/bin/env python3
-"""Person 2+3: detect blue block, apply homography, publish for pick_flow.
+"""Detect blue block and publish /block_position for pick_flow (two terminals).
 
-Publishes geometry_msgs/PointStamped on /block_position with latched QoS so
-pick_flow can join late and still get the last detection.
+Easy two-terminal flow (no --pick needed):
+  Terminal 1:  ./vision.sh          # or: python cam_to_coord.py
+  Terminal 2:  ./pick_vision.sh     # or: python pick_flow.py --vision
 
-Blue HSV is tuned from measured midpoint RGB=(33, 52, 100).
-
-Usage:
-  python cam_to_coord.py              # default: blue
-  python cam_to_coord.py --once
+Optional:
   python cam_to_coord.py --camera 1
+  python cam_to_coord.py --pick     # one-terminal: detect then launch pick_flow
 
-Env: ROS_DOMAIN_ID must match pick_flow (usually 10).
+Env: ROS_DOMAIN_ID should be 10 on both terminals.
 """
 import argparse
 import os
+import subprocess
 import sys
 import time
 from collections import deque
@@ -25,40 +24,44 @@ import numpy as np
 import rclpy
 from geometry_msgs.msg import PointStamped
 from rclpy.node import Node
-from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+from rclpy.qos import QoSProfile, ReliabilityPolicy
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from homography_transform import pixel_to_meters
 
 CAM_WIDTH = 1280
 CAM_HEIGHT = 720
+PICK_FLOW = str(Path(__file__).resolve().parent / "pick_flow.py")
 
-# Blue HSV from measured midpoint RGB=(33, 52, 100) — friend's calibration
-MID_RGB = (33, 52, 100)
-_mid_bgr = np.uint8([[[MID_RGB[2], MID_RGB[1], MID_RGB[0]]]])
-_mid_hsv = cv2.cvtColor(_mid_bgr, cv2.COLOR_BGR2HSV)[0, 0]
-H, S, V = int(_mid_hsv[0]), int(_mid_hsv[1]), int(_mid_hsv[2])
+def convert_to_hsv(Rvalue, Gvalue, Bvalue):
+    _mid_bgr = np.uint8([[[Bvalue, Gvalue, Rvalue]]])
+    _mid_hsv = cv2.cvtColor(_mid_bgr, cv2.COLOR_BGR2HSV)[0, 0]
+    H, S, V = int(_mid_hsv[0]), int(_mid_hsv[1]), int(_mid_hsv[2])
 
-H_TOL = 12
-S_TOL = 70
-V_TOL = 70
+    H_TOL = 12
+    S_TOL = 70
+    V_TOL = 70
 
-lo = np.array([max(0, H - H_TOL), max(40, S - S_TOL), max(30, V - V_TOL)])
-hi = np.array([min(179, H + H_TOL), 255, min(255, V + V_TOL)])
-COLOR_HSV = {
-    "blue": [(lo, hi)],
-}
-DRAW_COLOR = (int(_mid_bgr[0, 0, 0]), int(_mid_bgr[0, 0, 1]), int(_mid_bgr[0, 0, 2]))
+    lo = np.array([max(0, H - H_TOL), max(40, S - S_TOL), max(30, V - V_TOL)])
+    hi = np.array([min(179, H + H_TOL), 255, min(255, V + V_TOL)])
+    draw_color = (int(_mid_bgr[0, 0, 0]), int(_mid_bgr[0, 0, 1]), int(_mid_bgr[0, 0, 2]))
+    return lo, hi, draw_color
+
+
+blue_rgb = (33, 52, 100)
+purple_rgb = (67, 41, 65)
+yellow_rgb = (249, 222, 0)
+
+COLOR_HSV = {}
+DRAW_COLOR = {}
+for name, rgb in [("blue", blue_rgb), ("purple", purple_rgb), ("yellow", yellow_rgb)]:
+    lo, hi, draw = convert_to_hsv(*rgb)
+    COLOR_HSV[name] = [(lo, hi)]
+    DRAW_COLOR[name] = draw
 
 MIN_AREA_PX = 200
 SMOOTH_N = 3
-
-# Late-joining pick_flow still receives last pose (fixes hang)
-BLOCK_QOS = QoSProfile(
-    depth=10,
-    reliability=ReliabilityPolicy.RELIABLE,
-    durability=DurabilityPolicy.TRANSIENT_LOCAL,
-)
+BLOCK_QOS = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE)
 
 
 def color_mask(frame_bgr, color="blue"):
@@ -72,35 +75,50 @@ def color_mask(frame_bgr, color="blue"):
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
     return mask
 
+def detect_block(frame, color="auto", min_area=MIN_AREA_PX):
+    colors_to_check = COLOR_HSV.keys() if color == "auto" else [color]
 
-def detect_block(frame, color="blue", min_area=MIN_AREA_PX):
-    mask = color_mask(frame, color=color)
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return None
-    contour = max(contours, key=cv2.contourArea)
-    area = float(cv2.contourArea(contour))
-    if area < min_area:
-        return None
-    M = cv2.moments(contour)
-    if M["m00"] == 0:
-        return None
-    cx = M["m10"] / M["m00"]
-    cy = M["m01"] / M["m00"]
-    return cx, cy, area, contour, mask
+    best = None
+    for name in colors_to_check:
+        mask = color_mask(frame, color=name)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            continue
+        contour = max(contours, key=cv2.contourArea)
+        area = float(cv2.contourArea(contour))
+        if area < min_area:
+            continue
+
+        M = cv2.moments(contour)
+        if M["m00"] == 0:
+            continue
+        cx = M["m10"] / M["m00"]
+        cy = M["m01"] / M["m00"]
+
+        if best is None or area > best[2]:
+            best = (cx, cy, area, contour, mask, name)
+
+    return best
 
 
-def pixel_to_table(cx, cy):
-    return pixel_to_meters(cx, cy)
+def run_pick_flow(px, py, rot=90.0, grip_val=28, dry_run=False):
+    cmd = [
+        sys.executable, PICK_FLOW,
+        f"{px:.4f}", f"{py:.4f}", f"{rot:.1f}",
+        "0.02", "0.06", str(int(grip_val)), "25",
+    ]
+    print("->", " ".join(cmd), flush=True)
+    if dry_run:
+        return True
+    return subprocess.run(cmd).returncode == 0
 
 
 class BlockPublisher(Node):
     def __init__(self):
         super().__init__("cam_to_coord")
         self.pub = self.create_publisher(PointStamped, "/block_position", BLOCK_QOS)
-        domain = os.environ.get("ROS_DOMAIN_ID", "0")
         self.get_logger().info(
-            f"publishing /block_position (latched) | ROS_DOMAIN_ID={domain}"
+            f"publishing /block_position | ROS_DOMAIN_ID={os.environ.get('ROS_DOMAIN_ID', '0')}"
         )
 
     def publish_xy(self, x, y):
@@ -115,14 +133,27 @@ class BlockPublisher(Node):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Detect blue block and publish /block_position")
+    parser = argparse.ArgumentParser(
+        description="Blue block vision. Default: publish /block_position (use 2 terminals)."
+    )
     parser.add_argument("--camera", type=int, default=0)
-    parser.add_argument("--color", choices=sorted(COLOR_HSV.keys()), default="blue")
+    parser.add_argument("--color", choices=["auto"] + sorted(COLOR_HSV.keys()), default="auto")
     parser.add_argument("--min-area", type=int, default=MIN_AREA_PX)
-    parser.add_argument("--once", action="store_true")
+    parser.add_argument(
+        "--pick",
+        action="store_true",
+        help="optional one-terminal mode: after lock, run pick_flow.py PX PY",
+    )
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--rot", type=float, default=90.0)
+    parser.add_argument("--grip-val", type=int, default=28,
+                        help="gripper close value for --pick (100=open, lower=tighter, min 25)")
     parser.add_argument("--rate", type=float, default=10.0)
     parser.add_argument("--width", type=int, default=CAM_WIDTH)
     parser.add_argument("--height", type=int, default=CAM_HEIGHT)
+    # accept old flag names so older habit / docs don't error
+    parser.add_argument("--stream", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--once", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
 
     cap = cv2.VideoCapture(args.camera)
@@ -132,39 +163,39 @@ def main():
 
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
-    actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     print(
-        f"Camera {args.camera}: {actual_w}x{actual_h}, color={args.color}, "
-        f"ROS_DOMAIN_ID={os.environ.get('ROS_DOMAIN_ID', '0')}, "
-        f"HSV blue lo={lo.tolist()} hi={hi.tolist()}"
+        f"Camera {args.camera} | blue | "
+        f"mode={'PICK' if args.pick else 'TWO-TERMINAL publish'} | "
+        f"ROS_DOMAIN_ID={os.environ.get('ROS_DOMAIN_ID', '0')}"
     )
-    if abs(actual_w - args.width) > 40 or abs(actual_h - args.height) > 40:
-        print(
-            f"WARNING: requested {args.width}x{args.height} but got {actual_w}x{actual_h}; "
-            f"homography may be off"
-        )
-    print("Place the blue block in view. Expect 'PUB /block_position' lines. Press q to quit.")
+    if args.pick:
+        print("Will lock then launch pick_flow with PX PY args.")
+    else:
+        print("Publishing /block_position continuously.")
+        print("In OTHER terminal run:  ./pick_vision.sh   OR   python pick_flow.py --vision")
+    print("Press q to quit.")
 
-    rclpy.init()
-    node = BlockPublisher()
-    time.sleep(1.0)  # DDS advertise before first publish
+    node = None
+    if not args.pick:
+        rclpy.init()
+        node = BlockPublisher()
+        time.sleep(1.0)
+
     period = 1.0 / max(args.rate, 0.1)
-    published = False
     recent = deque(maxlen=SMOOTH_N)
-    last_pub = 0.0
+    pick_started = False
 
     try:
-        while rclpy.ok():
+        while True:
             ret, frame = cap.read()
             if not ret:
-                print("Failed to capture frame")
                 break
 
             result = detect_block(frame, color=args.color, min_area=args.min_area)
             if result is None:
                 display = frame.copy()
-                dbg = color_mask(frame, "blue")
+                debug_color = args.color if args.color != "auto" else "blue"
+                dbg = color_mask(frame, debug_color)
                 preview = cv2.cvtColor(dbg, cv2.COLOR_GRAY2BGR)
                 scale = 200 / max(preview.shape[1], 1)
                 preview = cv2.resize(
@@ -177,26 +208,17 @@ def main():
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2,
                 )
             else:
-                cx, cy, area, contour, mask = result
+                cx, cy, area, contour, mask , found_colour = result
                 recent.append((cx, cy))
                 sx = sum(p[0] for p in recent) / len(recent)
                 sy = sum(p[1] for p in recent) / len(recent)
-                x, y = pixel_to_table(sx, sy)
+                x, y = pixel_to_meters(sx, sy)
 
-                now = time.time()
-                if now - last_pub >= 0.2:
-                    node.publish_xy(x, y)
-                    last_pub = now
-                    published = True
-
-                display = frame.copy()
                 cv2.drawContours(display, [contour], -1, DRAW_COLOR, 2)
                 cv2.circle(display, (int(sx), int(sy)), 10, (0, 255, 0), -1)
-                cv2.circle(display, (int(sx), int(sy)), 14, (0, 255, 0), 2)
                 cv2.putText(
-                    display,
-                    f"blue ({x:.3f}, {y:.3f}) m  area={int(area)}",
-                    (int(sx) + 14, int(sy) - 14),
+                    display, f"blue ({x:.3f},{y:.3f})m",
+                    (int(sx) + 12, int(sy) - 12),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2,
                 )
                 preview = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
@@ -206,19 +228,42 @@ def main():
                 )
                 display[0:preview.shape[0], 0:preview.shape[1]] = preview
 
+                stable = len(recent) >= SMOOTH_N
+                if args.pick and stable and not pick_started:
+                    pick_started = True
+                    print(f"LOCKED x={x:.3f} y={y:.3f} — launching pick_flow", flush=True)
+                    cap.release()
+                    cv2.destroyAllWindows()
+                    ok = run_pick_flow(x, y, rot=args.rot, grip_val=args.grip_val, dry_run=args.dry_run)
+                    print("pick_flow:", "OK" if ok else "FAILED")
+                    raise SystemExit(0 if ok else 1)
+
+                if not args.pick and stable and node is not None:
+                    node.publish_xy(x, y)
+                    status = "PUBLISHING"
+                else:
+                    status = f"locking... {len(recent)}/{SMOOTH_N}"
+            else:
+                recent.clear()
+
+            cv2.putText(
+                display, status, (10, display.shape[0] - 16),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2,
+            )
             cv2.imshow("cam_to_coord", display)
             if (cv2.waitKey(1) & 0xFF) == ord("q"):
                 break
-
-            rclpy.spin_once(node, timeout_sec=0.0)
-            if args.once and published and len(recent) >= 2:
-                break
+            if node is not None:
+                rclpy.spin_once(node, timeout_sec=0.0)
             time.sleep(period)
     finally:
-        cap.release()
+        if cap.isOpened():
+            cap.release()
         cv2.destroyAllWindows()
-        node.destroy_node()
-        rclpy.shutdown()
+        if node is not None:
+            node.destroy_node()
+            if rclpy.ok():
+                rclpy.shutdown()
 
 
 if __name__ == "__main__":

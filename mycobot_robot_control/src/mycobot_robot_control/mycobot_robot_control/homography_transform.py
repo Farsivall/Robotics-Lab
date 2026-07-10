@@ -20,16 +20,20 @@ import cv2
 # ---------------------------------------------------------------------------
 # Calibration data (edit here if you re-calibrate)
 # ---------------------------------------------------------------------------
-# Original coordinates in cm (robot / world frame)
+# CM: (lateral_cm, forward_cm)  — robot Y, robot X
+# PX: (u, v) camera pixels
 CM_POINTS = np.array([
-    (-16, 0), (0, 0), (16, 0), (-6, 7.5), (8, 8),
-    (-16, 13.5), (0, 15), (16, 15), (-9, 20), (9, 20),
+    (-16.0, 0.0), (0.0, 0.0), (16.0, 0.0),
+    (-6.0, 7.5), (8.0, 8.0),
+    (-16.0, 13.5), (0.0, 15.0), (16.0, 15.0),
+    (-9.0, 20.0), (9.0, 20.0),
 ], dtype=np.float64)
 
-# Corresponding transformed coordinates in px (camera / image frame)
 PX_POINTS = np.array([
-    (945, 310), (647, 321), (352, 314), (791, 401),(467, 408),
-    (1051, 471), (647, 511), (223, 513), (384, 633), (933, 603),
+    (945, 310), (647, 321), (352, 314),
+    (791, 401), (467, 408),
+    (1051, 471), (647, 511), (223, 513),
+    (384, 633), (933, 603),
 ], dtype=np.float64)
 
 # Homography: pixel -> cm (swap src/dst if you need cm -> px instead)
@@ -48,12 +52,12 @@ def pixel_to_cm(x_px, y_px):
 def pixel_to_meters(x_px, y_px):
     """Pixel -> (x_forward_m, y_lateral_m) for pick_flow /block_position."""
     lateral_cm, forward_cm = pixel_to_cm(x_px, y_px)
-    return lateral_cm / 100.0, forward_cm / 100.0
+    return forward_cm / 100.0, lateral_cm / 100.0
 
 
 if __name__ == '__main__':
-    # Example usage — calibration pair (600, 332) <-> (0, 0) cm
-    x_in, y_in = 600, 332
+    # Example — calibration pair (647, 321) <-> (0, 0) cm
+    x_in, y_in = 647, 321
     x_out, y_out = pixel_to_cm(x_in, y_in)
     xf, yf = pixel_to_meters(x_in, y_in)
     print(f'px=({x_in}, {y_in}) -> cm=({x_out:.2f}, {y_out:.2f})')
