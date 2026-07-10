@@ -108,10 +108,16 @@ GRIP_CLOSE = 28
 print(f'grip hardcoded: open={GRIP_OPEN} close={GRIP_CLOSE} | ROBOT_IP={RIP}')
 
 # ---------------------------------------------------------------------------
-# Preset pick (center). Color input only drives the UI mask/detection.
+# Hardcoded pick per color (meters: x forward, y left).
+# blue = left (+y), yellow = center, purple = right (-y)
+# Color input also drives the UI mask/detection for that color.
 # ---------------------------------------------------------------------------
-# base-frame METERS: x forward, y left
-PRESET_PICK = (0.18, 0.00)   # known-good front-center
+PICK_POSITIONS = {
+    'blue':   (0.18,  0.06),  # left
+    'yellow': (0.18,  0.00),  # center
+    'purple': (0.18, -0.06),  # right
+}
+PRESET_PICK = PICK_POSITIONS[TARGET_COLOR]
 # place is: lift -> rotate ROT -> descend to PZ (same as original pick_flow)
 
 CAM_WIDTH = 1280
@@ -145,7 +151,7 @@ for _name, _rgb in COLOR_RGB.items():
 MIN_AREA_PX = 200
 SMOOTH_N = 3
 
-print(f"UI color={TARGET_COLOR} | preset pick ({PRESET_PICK[0]:.3f}, {PRESET_PICK[1]:.3f}) m | rotate={ROT}")
+print(f"color={TARGET_COLOR} -> pick ({PRESET_PICK[0]:.3f}, {PRESET_PICK[1]:.3f}) m | rotate={ROT}")
 
 
 def _color_mask(frame_bgr, color):
