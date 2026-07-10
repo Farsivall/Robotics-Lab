@@ -50,25 +50,31 @@ def parse_args(argv=None):
     p.add_argument("rot", nargs="?", type=float, default=90.0, help="base rotate deg")
     p.add_argument("grasp_z", nargs="?", type=float, default=0.02)
     p.add_argument("place_z", nargs="?", type=float, default=0.06)
-    p.add_argument("grip_val", nargs="?", type=int, default=35)
+    p.add_argument("grip_val", nargs="?", type=int, default=None,
+                   help="gripper close value (100=open, lower=tighter; min safe 25)")
     p.add_argument("speed", nargs="?", type=int, default=25)
     p.add_argument(
         "--vision",
         action="store_true",
         help="wait for /block_position instead of using PX PY args",
     )
+    p.add_argument("--grip-val", type=int, default=None, dest="grip_val_opt",
+                   help="override gripper close (e.g. 28). 100=open, lower=tighter. Min 25.")
+    p.add_argument("--grasp-z", type=float, default=None, dest="grasp_z_opt",
+                   help="override grasp height meters (default 0.02)")
     return p.parse_args(argv)
 
 
-def run_pick(px, py, rot=90.0, grasp_z=0.02, place_z=0.06, grip_val=35, speed=25,
+def run_pick(px, py, rot=90.0, grasp_z=0.02, place_z=0.06, grip_val=28, speed=25,
              use_vision=False, robot_ip=None):
     """Run one full pick-place cycle. Pass px/py OR use_vision=True.
 
-    Returns True on success. Exits with code 1 on failure (same as CLI).
+    grip_val: 100=fully open, lower=more closed. Keep >= 25 to avoid Pi brownout.
     """
     if grip_val < 25:
         print("GRIP_VAL < 25 risks stall-current brownout")
         raise SystemExit(2)
+    print(f"grip_val={grip_val} (100=open, lower=tighter)")
 
     rip = robot_ip or os.environ.get("ROBOT_IP", "192.168.123.50")
     ssh = [
@@ -319,13 +325,20 @@ def main(argv=None):
         use_vision = True
         px = args.px if args.px is not None else 0.18
         py = args.py if args.py is not None else 0.0
+
+    # Prefer --grip-val / --grasp-z flags; else positional; else defaults
+    grip = args.grip_val_opt if args.grip_val_opt is not None else (
+        args.grip_val if args.grip_val is not None else int(os.environ.get("GRIP_VAL", "28"))
+    )
+    gz = args.grasp_z_opt if args.grasp_z_opt is not None else args.grasp_z
+
     run_pick(
         px,
         py,
         rot=args.rot,
-        grasp_z=args.grasp_z,
+        grasp_z=gz,
         place_z=args.place_z,
-        grip_val=args.grip_val,
+        grip_val=grip,
         speed=args.speed,
         use_vision=use_vision,
     )

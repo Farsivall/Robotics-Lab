@@ -75,8 +75,12 @@ def detect_block(frame, color="blue", min_area=MIN_AREA_PX):
     return M["m10"] / M["m00"], M["m01"] / M["m00"], area, contour, mask
 
 
-def run_pick_flow(px, py, rot=90.0, dry_run=False):
-    cmd = [sys.executable, PICK_FLOW, f"{px:.4f}", f"{py:.4f}", f"{rot:.1f}"]
+def run_pick_flow(px, py, rot=90.0, grip_val=28, dry_run=False):
+    cmd = [
+        sys.executable, PICK_FLOW,
+        f"{px:.4f}", f"{py:.4f}", f"{rot:.1f}",
+        "0.02", "0.06", str(int(grip_val)), "25",
+    ]
     print("->", " ".join(cmd), flush=True)
     if dry_run:
         return True
@@ -116,6 +120,8 @@ def main():
     )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--rot", type=float, default=90.0)
+    parser.add_argument("--grip-val", type=int, default=28,
+                        help="gripper close value for --pick (100=open, lower=tighter, min 25)")
     parser.add_argument("--rate", type=float, default=10.0)
     parser.add_argument("--width", type=int, default=CAM_WIDTH)
     parser.add_argument("--height", type=int, default=CAM_HEIGHT)
@@ -190,7 +196,7 @@ def main():
                     print(f"LOCKED x={x:.3f} y={y:.3f} — launching pick_flow", flush=True)
                     cap.release()
                     cv2.destroyAllWindows()
-                    ok = run_pick_flow(x, y, rot=args.rot, dry_run=args.dry_run)
+                    ok = run_pick_flow(x, y, rot=args.rot, grip_val=args.grip_val, dry_run=args.dry_run)
                     print("pick_flow:", "OK" if ok else "FAILED")
                     raise SystemExit(0 if ok else 1)
 
