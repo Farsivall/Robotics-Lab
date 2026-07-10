@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
-"""One-shot pick + base-rotate + place orchestrator, WITH in-process vision.
+"""Color-driven pick + base-rotate + place, WITH in-process vision.
 
-Combines cam_to_coord.py (blue-block detection) directly into pick_flow.py:
-the webcam is opened and read inside vision_step(), a smoothed pixel centroid
-is converted to table coords via homography, and that's fed straight into
-approach_pick(). No /block_position ROS topic, no second terminal, no DDS
-discovery race.
+Mimics the original pick_flow.py motion exactly (home -> open -> approach ->
+descend -> partial close -> lift -> rotate J1 -> place descend -> open ->
+retreat -> home) but you tell it WHICH color to grab. The webcam detects that
+color (tracking visuals on), then the arm goes to the hardcoded pick position
+for that color and runs the pick.
 
-Sequence: vision -> home -> open -> approach -> descend -> partial close ->
-          lift -> rotate J1 -> place descend -> open -> retreat -> home.
+Sequence: vision(detect chosen color) -> home -> open -> approach -> descend ->
+          partial close -> lift -> rotate J1 -> place descend -> open ->
+          retreat -> home.
 
-Usage: python pick_flow_vision.py [PX PY ROT [GRASP_Z PLACE_Z GRIP_VAL SPEED]]
-       defaults: 0.18 0 90 0.02 0.06 28 25
-       omit PX/PY to use the webcam instead (default behavior)
+Usage: python pick_flow_vision.py [COLOR] [ROT]
+       COLOR = blue | yellow | purple   (which block to find + pick; default blue)
+       ROT   = base rotate degrees for the place side (default 90)
 Env:   ROBOT_IP     overrides target robot (default 192.168.123.50)
        CAMERA_INDEX overrides cv2.VideoCapture index (default 0)
 """
@@ -33,15 +34,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 # CONFIRM pixel_to_cm actually returns centimeters, or targets will be 100x off.
 from homography_transform import pixel_to_meters as _pixel_to_table
 
-a = sys.argv[1:]
-USE_VISION = len(a) < 2
-PX = float(a[0]) if len(a) > 0 else 0.18
-PY = float(a[1]) if len(a) > 1 else 0.0
-ROT = float(a[2]) if len(a) > 2 else 90.0
-GZ = float(a[3]) if len(a) > 3 else 0.02
-PZ = float(a[4]) if len(a) > 4 else 0.06
-GV = int(a[5]) if len(a) > 5 else 28
-SP = int(a[6]) if len(a) > 6 else 25
+_args = sys.argv[1:]
+TARGET_COLOR = _args[0].lower() if len(_args) > 0 else 'blue'
+ROT = float(_args[1]) if len(_args) > 1 else 90.0
+GZ = 0.02
+PZ = 0.06
+GV = 28
+SP = 25
 
 DEG = np.pi / 180.0; RAD = 180.0 / np.pi
 LIMS = np.array([165, 165, 165, 165, 165, 179.0])
@@ -72,14 +71,46 @@ CAM_WIDTH = 1280
 CAM_HEIGHT = 720
 CAMERA_INDEX = int(os.environ.get('CAMERA_INDEX', 0))
 
-MID_RGB = (33, 52, 100)  # blue calibration midpoint
-_mid_bgr = np.uint8([[[MID_RGB[2], MID_RGB[1], MID_RGB[0]]]])
-_mid_hsv = cv2.cvtColor(_mid_bgr, cv2.COLOR_BGR2HSV)[0, 0]
-H, S, V = int(_mid_hsv[0]), int(_mid_hsv[1]), int(_mid_hsv[2])
-H_TOL, S_TOL, V_TOL = 12, 70, 70
-HSV_LO = np.array([max(0, H - H_TOL), max(40, S - S_TOL), max(30, V - V_TOL)])
-HSV_HI = np.array([min(179, H + H_TOL), 255, min(255, V + V_TOL)])
-DRAW_COLOR = (int(_mid_bgr[0, 0, 0]), int(_mid_bgr[0, 0, 1]), int(_mid_bgr[0, 0, 2]))
+# Color midpoints (RGB) — same values as cam_to_coord.py
+COLOR_RGB = {
+    'blue':   (33, 52, 100),
+    'purple': (67, 41, 65),
+    'yellow': (249, 222, 0),
+}
+
+def _hsv_range(r, g, b):
+    mid_bgr = np.uint8([[[b, g, r]]])
+    mid_hsv = cv2.cvtColor(mid_bgr, cv2.COLOR_BGR2HSV)[0, 0]
+    h, s, v = int(mid_hsv[0]), int(mid_hsv[1]), int(mid_hsv[2])
+    h_tol, s_tol, v_tol = 12, 70, 70
+    lo = np.array([max(0, h - h_tol), max(40, s - s_tol), max(30, v - v_tol)])
+    hi = np.array([min(179, h + h_tol), 255, min(255, v + v_tol)])
+    draw = (int(mid_bgr[0, 0, 0]), int(mid_bgr[0, 0, 1]), int(mid_bgr[0, 0, 2]))
+    return lo, hi, draw
+
+COLOR_HSV = {}
+DRAW_BY_COLOR = {}
+for _name, _rgb in COLOR_RGB.items():
+    _lo, _hi, _draw = _hsv_range(*_rgb)
+    COLOR_HSV[_name] = (_lo, _hi)
+    DRAW_BY_COLOR[_name] = _draw
+
+# HARDCODED pick position per color, base-frame METERS (x forward, y left).
+# The camera confirms/tracks the chosen color; the arm goes to these coords.
+# EDIT to match where each block actually sits.
+PICK_POSITIONS = {
+    'blue':   (0.18,  0.00),
+    'yellow': (0.18, -0.06),
+    'purple': (0.18,  0.06),
+}
+
+if TARGET_COLOR not in COLOR_HSV:
+    print(f"unknown color '{TARGET_COLOR}'. Use one of: {', '.join(COLOR_HSV)}")
+    raise SystemExit(2)
+HSV_LO, HSV_HI = COLOR_HSV[TARGET_COLOR]
+DRAW_COLOR = DRAW_BY_COLOR[TARGET_COLOR]
+PX, PY = PICK_POSITIONS[TARGET_COLOR]
+print(f"target color: {TARGET_COLOR} -> hardcoded pick ({PX:.3f}, {PY:.3f}) m")
 
 MIN_AREA_PX = 200
 SMOOTH_N = 3          # frames to average
@@ -130,7 +161,7 @@ def capture_block_xy(timeout=VISION_TIMEOUT, show=True):
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_HEIGHT)
     actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    print(f"vision: camera {CAMERA_INDEX} {actual_w}x{actual_h}, waiting for blue block "
+    print(f"vision: camera {CAMERA_INDEX} {actual_w}x{actual_h}, waiting for {TARGET_COLOR} block "
           f"(need {STABLE_N} stable frames, timeout {timeout:.0f}s, 'q' to abort)")
 
     recent = deque(maxlen=SMOOTH_N)
@@ -156,7 +187,7 @@ def capture_block_xy(timeout=VISION_TIMEOUT, show=True):
                     scale = 200 / max(dbg.shape[1], 1)
                     dbg = cv2.resize(dbg, (int(dbg.shape[1] * scale), int(dbg.shape[0] * scale)))
                     display[0:dbg.shape[0], 0:dbg.shape[1]] = dbg
-                    cv2.putText(display, "no blue block", (10, dbg.shape[0] + 24),
+                    cv2.putText(display, f"no {TARGET_COLOR} block", (10, dbg.shape[0] + 24),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
             else:
                 cx, cy, area, contour, mask = det
@@ -169,13 +200,14 @@ def capture_block_xy(timeout=VISION_TIMEOUT, show=True):
                 if show:
                     cv2.drawContours(display, [contour], -1, DRAW_COLOR, 2)
                     cv2.circle(display, (int(sx), int(sy)), 10, (0, 255, 0), -1)
-                    cv2.putText(display, f"({x:.3f},{y:.3f}) m  n={stable_count}/{STABLE_N}",
+                    cv2.putText(display,
+                                f"{TARGET_COLOR} -> pick ({PX:.3f},{PY:.3f})m  n={stable_count}/{STABLE_N}",
                                 (int(sx) + 14, int(sy) - 14),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
                 if stable_count >= STABLE_N:
                     result_xy = (x, y)
-                    print(f"vision: locked block at x={x:.3f} y={y:.3f} (m)")
+                    print(f"vision: {TARGET_COLOR} locked (mapped x={x:.3f} y={y:.3f} m)")
                     break
 
             if show:
@@ -202,7 +234,7 @@ target = {'x': None, 'y': None}
 
 node.create_subscription(MycobotAngles, '/mycobot/angles_real',
     lambda m: real.__setitem__('a', np.array([m.joint_1, m.joint_2, m.joint_3, m.joint_4, m.joint_5, m.joint_6], float)), 10)
-print(f"pick_flow ready | vision={USE_VISION} | ROS_DOMAIN_ID={os.environ.get('ROS_DOMAIN_ID', '0')}")
+print(f"pick_flow ready | color={TARGET_COLOR} | ROS_DOMAIN_ID={os.environ.get('ROS_DOMAIN_ID', '0')}")
 
 def fresh(t=4.0):
     real['a'] = None; t0 = time.time()
@@ -290,11 +322,10 @@ def grip(v, sp):
     return True
 
 def approach_pick():
-    px, py = (PX, PY) if not USE_VISION else (target['x'], target['y'])
-    if px is None or py is None:
+    if target['x'] is None or target['y'] is None:
         print('approach: no target coords')
         return False
-    return approach(px, py, GZ + APPR)
+    return approach(target['x'], target['y'], GZ + APPR)
 
 def solve_ik(x, y, z):
     """Best IK for (x,y,z): try current-pose seed (lets off-center targets
@@ -370,14 +401,14 @@ def rotate(delta):
     print('rotate: OK'); return True
 
 def vision_step():
-    """Grab block pose from the webcam BEFORE moving the arm."""
-    if not USE_VISION:
-        print(f'vision: using CLI PX={PX} PY={PY}')
-        return True
-    px, py = capture_block_xy()
-    if px is None:
+    """Detect the chosen color with the webcam BEFORE moving the arm, then
+    pick at that color's HARDCODED position."""
+    mx, my = capture_block_xy()
+    if mx is None:
         return False
-    target['x'], target['y'] = px, py
+    target['x'], target['y'] = PX, PY
+    print(f"vision: {TARGET_COLOR} detected (mapped {mx:.3f},{my:.3f}) "
+          f"-> using hardcoded pick ({PX:.3f},{PY:.3f})")
     return True
 
 steps = [
