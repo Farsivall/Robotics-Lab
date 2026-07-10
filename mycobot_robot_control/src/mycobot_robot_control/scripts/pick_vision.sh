@@ -29,5 +29,8 @@ export ROS_LOCALHOST_ONLY=0
 export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-10}"
 
 echo "== pick_vision: waiting for /block_position | ROS_DOMAIN_ID=$ROS_DOMAIN_ID =="
+# Tighter grip: lower number = more closed. Keep >= 25.
+GRIP="${GRIP_VAL:-28}"
+echo "== grip_val=$GRIP (override with GRIP_VAL=30 ./pick_vision.sh) =="
 NOISE='^\[|pybullet build|iteration|position target|orientation target|found solution|share directory|Joint info|Link info|null|argv|Warning|inertial|robot_base|g_base|joint._to|^ *[cIm] =|^ *[0-9e.+ -]+ *$|^universe|file path|joint6output|^ *m = '
-exec python "$PY_DIR/pick_flow.py" --vision 2>&1 | grep --line-buffered -vE "$NOISE"
+exec python "$PY_DIR/pick_flow.py" --vision --grip-val "$GRIP" 2>&1 | grep --line-buffered -vE "$NOISE"
