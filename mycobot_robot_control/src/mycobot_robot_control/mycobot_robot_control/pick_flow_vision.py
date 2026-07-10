@@ -296,16 +296,38 @@ def approach_pick():
         return False
     return approach(px, py, GZ + APPR)
 
+def solve_ik(x, y, z):
+    """Best IK for (x,y,z): try current-pose seed (lets off-center targets
+    solve) then zero seed (accurate near the front-center default)."""
+    cur = fresh(4)
+    attempts = []
+    if cur is not None:
+        attempts.append(('current-seed', cur * DEG, True))
+    attempts.append(('zero-seed', np.zeros(6), False))
+    best = None
+    for label, seed, use_seed in attempts:
+        node.real_angles = seed
+        ik = node.calculate_ik(np.array([x, y, z]), DOWN, 'gripper', 1e-5, 0.3, 0.02, use_seed, 4000, False)
+        if ik is None:
+            continue
+        adj = np.array(node.adjust_angles(np.array(ik)), float)
+        pos, _eul = node.get_pose(adj * DEG, 'gripper')
+        err = float(np.linalg.norm(pos - [x, y, z]))
+        if not np.all(np.abs(adj) <= LIMS):
+            continue
+        if best is None or err < best[1]:
+            best = (adj, err, label)
+    return best
+
 def approach(x, y, z):
-    ik = node.calculate_ik(np.array([x, y, z]), DOWN, 'gripper', 1e-5, 0.3, 0.02, False, 4000, False)
-    if ik is None: print('approach: IK None'); return False
-    adj = np.array(node.adjust_angles(np.array(ik)), float)
-    pos, eul = node.get_pose(adj * DEG, 'gripper')
-    err = float(np.linalg.norm(pos - [x, y, z]))
-    if err > 0.02 or not np.all(np.abs(adj) <= LIMS):
-        print(f'approach: REFUSED (err {err*1000:.0f}mm)'); return False
+    best = solve_ik(x, y, z)
+    if best is None:
+        print('approach: IK None (no in-limit solution from any seed)'); return False
+    adj, err, label = best
+    if err > 0.02:
+        print(f'approach: REFUSED (err {err*1000:.0f}mm, {label})'); return False
     ok = goto(adj, SP)
-    print(f'approach: {"OK" if ok else "TIMEOUT"} err={err*1000:.1f}mm'); return ok
+    print(f'approach: {"OK" if ok else "TIMEOUT"} err={err*1000:.1f}mm ({label})'); return ok
 
 def move_z(tz, speed):
     b = fresh(6)

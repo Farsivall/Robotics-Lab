@@ -242,22 +242,44 @@ def run_pick(px, py, rot=90.0, grasp_z=0.02, place_z=0.06, grip_val=None, speed=
             rclpy.spin_once(node, timeout_sec=0.05)
         return float(target["x"]), float(target["y"])
 
+    def solve_ik(x, y, z):
+        """Best IK for (x,y,z). Zero-seed only converges near front-center, so
+        also try seeding from the current pose — that's what lets off-center
+        targets (nonzero y) solve, not just the (0.18, 0) default."""
+        cur = fresh(4)
+        attempts = []
+        if cur is not None:
+            attempts.append(("current-seed", cur * DEG, True))
+        attempts.append(("zero-seed", np.zeros(6), False))
+        best = None
+        for label, seed, use_seed in attempts:
+            node.real_angles = seed
+            ik = node.calculate_ik(
+                np.array([x, y, z]), DOWN, "gripper", 1e-5, 0.3, 0.02, use_seed, 4000, False
+            )
+            if ik is None:
+                continue
+            adj = np.array(node.adjust_angles(np.array(ik)), float)
+            pos, _eul = node.get_pose(adj * DEG, "gripper")
+            err = float(np.linalg.norm(pos - [x, y, z]))
+            if not np.all(np.abs(adj) <= LIMS):
+                continue
+            if best is None or err < best[1]:
+                best = (adj, err, label)
+        return best
+
     def approach(x, y, z):
         print(f"approach: target x={x:.3f} y={y:.3f} z={z:.3f}")
-        ik = node.calculate_ik(
-            np.array([x, y, z]), DOWN, "gripper", 1e-5, 0.3, 0.02, False, 4000, False
-        )
-        if ik is None:
-            print("approach: IK None")
+        best = solve_ik(x, y, z)
+        if best is None:
+            print("approach: IK None (no in-limit solution from any seed)")
             return False
-        adj = np.array(node.adjust_angles(np.array(ik)), float)
-        pos, _eul = node.get_pose(adj * DEG, "gripper")
-        err = float(np.linalg.norm(pos - [x, y, z]))
-        if err > 0.02 or not np.all(np.abs(adj) <= LIMS):
-            print(f"approach: REFUSED (err {err*1000:.0f}mm) — coords may be out of reach")
+        adj, err, label = best
+        if err > 0.02:
+            print(f"approach: REFUSED (err {err*1000:.0f}mm, {label}) — coords may be out of reach")
             return False
         ok = goto(adj, speed)
-        print(f'approach: {"OK" if ok else "TIMEOUT"} err={err*1000:.1f}mm')
+        print(f'approach: {"OK" if ok else "TIMEOUT"} err={err*1000:.1f}mm ({label})')
         return ok
 
     def move_z(tz, spd):
