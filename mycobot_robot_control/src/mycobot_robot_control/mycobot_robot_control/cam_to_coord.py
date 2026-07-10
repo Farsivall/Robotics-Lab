@@ -70,9 +70,9 @@ BLOCK_QOS = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE)
 # homography-mapped point. EDIT these to match where each block actually sits.
 # ---------------------------------------------------------------------------
 PICK_POSITIONS = {
-    "blue":   (0.18,  0.00),
-    "yellow": (0.18, -0.06),
-    "purple": (0.18,  0.06),
+    "blue":   (0.18,  0.06),  # left
+    "yellow": (0.18,  0.00),  # center
+    "purple": (0.18, -0.06),  # right
 }
 
 

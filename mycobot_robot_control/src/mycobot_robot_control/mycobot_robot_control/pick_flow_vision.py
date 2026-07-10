@@ -1,18 +1,17 @@
 #!/usr/bin/env python3
-"""Preset pick + place with color-detection UI overlay.
+"""Color-select pick + place with detection UI overlay.
 
-Camera shows color tracking (blue / yellow / purple) for the demo UI, then
-the arm ALWAYS runs the original pick_flow motion to a hardcoded pick and
-place — detection does not gate the motion (color sorting comes later).
+Pass blue / yellow / purple: camera shows that color briefly, then the arm
+picks at a hardcoded offset for that color (blue=left, yellow=center,
+purple=right) and runs the original place motion.
 
-Sequence: vision(show detection briefly) -> home -> open -> approach ->
-          descend -> partial close -> lift -> rotate J1 -> place descend ->
-          open -> retreat -> home.
+Sequence: vision(show detection) -> home -> open -> approach -> descend ->
+          grip -> lift -> rotate -> place -> open -> retreat -> home.
 
-Usage: python pick_flow_vision.py [ROT]
-       ROT = base rotate degrees for the place side (default 90)
-Env:   ROBOT_IP     overrides target robot (default 192.168.123.50)
-       CAMERA_INDEX overrides cv2.VideoCapture index (default 0)
+Usage: python pick_flow_vision.py [COLOR] [ROT]
+       COLOR = blue | yellow | purple  (default yellow = center)
+       ROT   = place-side base rotate degrees (default 90)
+Env:   ROBOT_IP, CAMERA_INDEX
 """
 import os, shutil, subprocess, sys, time
 from collections import deque
@@ -27,19 +26,16 @@ from mycobot_msgs_2.msg import MycobotAngles, MycobotSetAngles
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 _args = sys.argv[1:]
-# Optional: first arg can still be a color (ignored for motion) or ROT degrees
 ROT = 90.0
+TARGET_COLOR = 'yellow'  # center default
 if len(_args) >= 1:
-    if _args[0].lower() in ("blue", "yellow", "purple"):
-        # color arg kept for UI preference only; motion still uses preset
-        UI_COLOR_PREF = _args[0].lower()
+    if _args[0].lower() in ('blue', 'yellow', 'purple'):
+        TARGET_COLOR = _args[0].lower()
         if len(_args) >= 2:
             ROT = float(_args[1])
     else:
-        UI_COLOR_PREF = "auto"
         ROT = float(_args[0])
-else:
-    UI_COLOR_PREF = "auto"
+UI_COLOR_PREF = TARGET_COLOR
 
 GZ = 0.02
 PZ = 0.06
@@ -112,10 +108,15 @@ GRIP_CLOSE = 28
 print(f'grip hardcoded: open={GRIP_OPEN} close={GRIP_CLOSE} | ROBOT_IP={RIP}')
 
 # ---------------------------------------------------------------------------
-# Preset pick / place (motion always uses these — color sorting later)
+# Hardcoded pick per color (meters: x forward, y left).
+# blue = left (+y), yellow = center, purple = right (-y)
 # ---------------------------------------------------------------------------
-# base-frame METERS: x forward, y left
-PRESET_PICK = (0.18, 0.00)   # known-good front-center
+PICK_POSITIONS = {
+    'blue':   (0.18,  0.06),  # left
+    'yellow': (0.18,  0.00),  # center
+    'purple': (0.18, -0.06),  # right
+}
+PRESET_PICK = PICK_POSITIONS[TARGET_COLOR]
 # place is: lift -> rotate ROT -> descend to PZ (same as original pick_flow)
 
 CAM_WIDTH = 1280
@@ -149,7 +150,7 @@ for _name, _rgb in COLOR_RGB.items():
 MIN_AREA_PX = 200
 SMOOTH_N = 3
 
-print(f"preset pick ({PRESET_PICK[0]:.3f}, {PRESET_PICK[1]:.3f}) m | rotate={ROT} | UI color={UI_COLOR_PREF}")
+print(f"color={TARGET_COLOR} -> pick ({PRESET_PICK[0]:.3f}, {PRESET_PICK[1]:.3f}) m | rotate={ROT}")
 
 
 def _color_mask(frame_bgr, color):
@@ -228,7 +229,7 @@ def show_detection_preview(seconds=PREVIEW_SEC):
                 cv2.drawContours(display, [contour], -1, draw, 2)
                 cv2.circle(display, (int(sx), int(sy)), 10, (0, 255, 0), -1)
                 cv2.putText(display,
-                            f"{name} seen | preset pick ({PRESET_PICK[0]:.2f},{PRESET_PICK[1]:.2f})",
+                            f"{name} | pick {TARGET_COLOR} ({PRESET_PICK[0]:.2f},{PRESET_PICK[1]:.2f})",
                             (int(sx) + 14, int(sy) - 14),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
                 preview = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
@@ -262,7 +263,7 @@ target = {'x': PRESET_PICK[0], 'y': PRESET_PICK[1]}
 
 node.create_subscription(MycobotAngles, '/mycobot/angles_real',
     lambda m: real.__setitem__('a', np.array([m.joint_1, m.joint_2, m.joint_3, m.joint_4, m.joint_5, m.joint_6], float)), 10)
-print(f"pick_flow ready | preset pick={PRESET_PICK} | ROS_DOMAIN_ID={os.environ.get('ROS_DOMAIN_ID', '0')}")
+print(f"pick_flow ready | color={TARGET_COLOR} pick={PRESET_PICK} | ROS_DOMAIN_ID={os.environ.get('ROS_DOMAIN_ID', '0')}")
 
 def fresh(t=4.0):
     real['a'] = None; t0 = time.time()
@@ -352,16 +353,32 @@ def grip(v, sp):
     return True
 
 def approach(x, y, z):
-    # Original Summer School approach: zero-seed IK (works at preset front-center)
-    ik = node.calculate_ik(np.array([x, y, z]), DOWN, 'gripper', 1e-5, 0.3, 0.02, False, 4000, False)
-    if ik is None: print('approach: IK None'); return False
-    adj = np.array(node.adjust_angles(np.array(ik)), float)
-    pos, eul = node.get_pose(adj * DEG, 'gripper')
-    err = float(np.linalg.norm(pos - [x, y, z]))
-    if err > 0.02 or not np.all(np.abs(adj) <= LIMS):
-        print(f'approach: REFUSED (err {err*1000:.0f}mm)'); return False
+    # Try current-pose seed first so left/right offsets converge; fall back to zero seed.
+    cur = fresh(4)
+    attempts = []
+    if cur is not None:
+        attempts.append(('current-seed', cur * DEG, True))
+    attempts.append(('zero-seed', np.zeros(6), False))
+    best = None
+    for label, seed, use_seed in attempts:
+        node.real_angles = seed
+        ik = node.calculate_ik(np.array([x, y, z]), DOWN, 'gripper', 1e-5, 0.3, 0.02, use_seed, 4000, False)
+        if ik is None:
+            continue
+        adj = np.array(node.adjust_angles(np.array(ik)), float)
+        pos, _eul = node.get_pose(adj * DEG, 'gripper')
+        err = float(np.linalg.norm(pos - [x, y, z]))
+        if not np.all(np.abs(adj) <= LIMS):
+            continue
+        if best is None or err < best[1]:
+            best = (adj, err, label)
+    if best is None:
+        print('approach: IK None'); return False
+    adj, err, label = best
+    if err > 0.02:
+        print(f'approach: REFUSED (err {err*1000:.0f}mm, {label})'); return False
     ok = goto(adj, SP)
-    print(f'approach: {"OK" if ok else "TIMEOUT"} err={err*1000:.1f}mm'); return ok
+    print(f'approach: {"OK" if ok else "TIMEOUT"} err={err*1000:.1f}mm ({label})'); return ok
 
 def move_z(tz, speed):
     b = fresh(6)
@@ -404,10 +421,10 @@ def rotate(delta):
     print('rotate: OK'); return True
 
 def vision_step():
-    """UI-only color detection, then always use the preset pick."""
+    """Show color detection in the UI, then pick at the color's hardcoded spot."""
     show_detection_preview(PREVIEW_SEC)
     target['x'], target['y'] = PRESET_PICK
-    print(f"vision: starting preset pick ({PRESET_PICK[0]:.3f}, {PRESET_PICK[1]:.3f})")
+    print(f"vision: {TARGET_COLOR} -> pick ({PRESET_PICK[0]:.3f}, {PRESET_PICK[1]:.3f})")
     return True
 
 def approach_pick():
