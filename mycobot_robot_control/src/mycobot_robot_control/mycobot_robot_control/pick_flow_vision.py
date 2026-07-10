@@ -1,19 +1,13 @@
 #!/usr/bin/env python3
-"""Color-select pick + place with detection UI overlay.
+"""Color-select pick + place with live camera UI for the whole motion.
 
-Pass blue / yellow / purple: camera shows that color briefly, then the arm
-picks at a hardcoded offset for that color (blue=left, yellow=center,
-purple=right) and runs the original place motion.
-
-Sequence: vision(show detection) -> home -> open -> approach -> descend ->
-          grip -> lift -> rotate -> place -> open -> retreat -> home.
+Pass blue / yellow / purple: camera shows that color's mask for the entire
+pick/place, and the arm picks at a hardcoded offset (blue=left, yellow=center,
+purple=right).
 
 Usage: python pick_flow_vision.py [COLOR] [ROT]
-       COLOR = blue | yellow | purple  (default yellow = center)
-       ROT   = place-side base rotate degrees (default 90)
-Env:   ROBOT_IP, CAMERA_INDEX
 """
-import os, shutil, subprocess, sys, time
+import os, shutil, subprocess, sys, time, threading
 from collections import deque
 from pathlib import Path
 
@@ -123,7 +117,16 @@ PRESET_PICK = PICK_POSITIONS[TARGET_COLOR]
 CAM_WIDTH = 1280
 CAM_HEIGHT = 720
 CAMERA_INDEX = int(os.environ.get('CAMERA_INDEX', 0))
-PREVIEW_SEC = 4.0  # show detection UI this long, then always start the pick
+PREVIEW_SEC = 2.0  # brief settle after camera starts, before arm moves
+
+# Shared state for the always-on camera UI thread
+_cam = {
+    'stop': threading.Event(),
+    'step': 'starting',
+    'seen': None,
+    'thread': None,
+    'ok': False,
+}
 
 COLOR_RGB = {
     'blue':   (33, 52, 100),
@@ -185,29 +188,28 @@ def _detect_color(frame, color, min_area=MIN_AREA_PX):
     return cx, cy, area, contour, mask, color
 
 
-def show_detection_preview(seconds=PREVIEW_SEC):
-    """Show masking + tracking for the INPUT color, then start the pick."""
+def _camera_loop():
+    """Run camera + mask UI until stop is set (whole pick duration)."""
     look = TARGET_COLOR if TARGET_COLOR in COLOR_HSV else 'blue'
     cap = cv2.VideoCapture(CAMERA_INDEX)
     if not cap.isOpened():
-        print(f"vision: camera {CAMERA_INDEX} not available — skipping UI, starting pick anyway")
+        print(f"vision: camera {CAMERA_INDEX} not available — UI off, pick continues")
+        _cam['ok'] = False
         return
+    _cam['ok'] = True
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAM_WIDTH)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_HEIGHT)
-    print(f"vision: looking for {look} (masking {look}) for {seconds:.0f}s. Press q to skip.")
+    print(f"vision: camera live for whole pick | looking for {look} (mask={look})")
     recent = deque(maxlen=SMOOTH_N)
-    t0 = time.time()
-    last_seen = None
     try:
-        while time.time() - t0 < seconds:
+        while not _cam['stop'].is_set():
             ret, frame = cap.read()
             if not ret:
-                break
+                time.sleep(0.05)
+                continue
             display = frame.copy()
-            # Always show THIS color's mask in the corner (not blue by default)
             mask_ui = _color_mask(frame, look)
             preview = cv2.cvtColor(mask_ui, cv2.COLOR_GRAY2BGR)
-            # tint mask preview with the draw color so it's obvious which HSV is active
             tint = np.zeros_like(preview)
             tint[:] = DRAW_BY_COLOR[look]
             preview = np.where(mask_ui[..., None] > 0, tint, preview)
@@ -226,7 +228,7 @@ def show_detection_preview(seconds=PREVIEW_SEC):
                 recent.append((cx, cy))
                 sx = sum(p[0] for p in recent) / len(recent)
                 sy = sum(p[1] for p in recent) / len(recent)
-                last_seen = name
+                _cam['seen'] = name
                 draw = DRAW_BY_COLOR[name]
                 cv2.drawContours(display, [contour], -1, draw, 2)
                 cv2.circle(display, (int(sx), int(sy)), 10, (0, 255, 0), -1)
@@ -235,21 +237,42 @@ def show_detection_preview(seconds=PREVIEW_SEC):
                             (int(sx) + 14, int(sy) - 14),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
 
-            left = max(0.0, seconds - (time.time() - t0))
-            cv2.putText(display, f"input={look}  mask={look}  pick in {left:.1f}s",
+            step = _cam.get('step', '')
+            cv2.putText(display, f"input={look}  mask={look}  step={step}",
                         (10, display.shape[0] - 16),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
             cv2.imshow("pick_flow vision", display)
-            if (cv2.waitKey(1) & 0xFF) == ord("q"):
-                print("vision: preview skipped")
+            # keep UI responsive; q only closes the window early (pick still runs)
+            if (cv2.waitKey(1) & 0xFF) == ord('q'):
+                print("vision: UI closed early (pick continues)")
                 break
+            time.sleep(0.01)
     finally:
         cap.release()
-        cv2.destroyAllWindows()
-    if last_seen:
-        print(f"vision: {look} seen in UI (motion still uses preset pick for {look})")
-    else:
-        print(f"vision: {look} not locked in UI — pick continues with preset anyway")
+        try:
+            cv2.destroyAllWindows()
+        except Exception:
+            pass
+
+
+def start_camera_ui():
+    """Start camera UI thread for the whole pick."""
+    if _cam['thread'] is not None and _cam['thread'].is_alive():
+        return
+    _cam['stop'].clear()
+    _cam['step'] = 'vision'
+    t = threading.Thread(target=_camera_loop, name='pick-camera-ui', daemon=True)
+    _cam['thread'] = t
+    t.start()
+
+
+def stop_camera_ui():
+    """Stop camera UI thread after pick finishes."""
+    _cam['stop'].set()
+    t = _cam['thread']
+    if t is not None:
+        t.join(timeout=3.0)
+    _cam['thread'] = None
 
 
 # ---------------------------------------------------------------------------
@@ -419,35 +442,42 @@ def rotate(delta):
     print('rotate: OK'); return True
 
 def vision_step():
-    """Show color detection in the UI, then pick at the color's hardcoded spot."""
-    show_detection_preview(PREVIEW_SEC)
+    """Start camera UI for the whole pick, then use the color's hardcoded spot."""
+    start_camera_ui()
+    time.sleep(PREVIEW_SEC)  # let the window come up before the arm moves
     target['x'], target['y'] = PRESET_PICK
-    print(f"vision: {TARGET_COLOR} -> pick ({PRESET_PICK[0]:.3f}, {PRESET_PICK[1]:.3f})")
+    print(f"vision: {TARGET_COLOR} -> pick ({PRESET_PICK[0]:.3f}, {PRESET_PICK[1]:.3f}) | camera stays on")
     return True
 
 def approach_pick():
     return approach(float(target['x']), float(target['y']), GZ + APPR)
 
-# Same step list as original Summer School pick_flow.py (+ brief vision UI)
+# Same step list as original Summer School pick_flow.py (+ live camera UI)
 steps = [
     ('vision',        vision_step),
     ('home',          lambda: home()),
-    ('open',          lambda: grip(GRIP_OPEN, 40)),
+    ('open',          lambda: grip(GRIP_OPEN, 50)),
     ('approach',      approach_pick),
     ('descend',       lambda: move_z(GZ, 15)),
     ('grip',          lambda: grip(GRIP_CLOSE, 15)),
     ('lift',          lambda: move_z(LIFT, SP)),
     ('rotate',        lambda: rotate(ROT)),
     ('place-descend', lambda: move_z(PZ, SP)),
-    ('release',       lambda: grip(GRIP_OPEN, 40)),
+    ('release',       lambda: grip(GRIP_OPEN, 50)),
     ('retreat',       lambda: move_z(0.12, SP)),
     ('home-end',      lambda: home()),
 ]
 t_start = time.time()
-for name, fn in steps:
-    print(f'== {name} ==')
-    if not fn():
-        print(f'!! FAILED at {name} -- ABORT, arm holds position')
-        node.destroy_node(); rclpy.shutdown(); raise SystemExit(1)
-print(f'== DONE in {time.time()-t_start:.0f}s ==')
-node.destroy_node(); rclpy.shutdown()
+try:
+    for name, fn in steps:
+        _cam['step'] = name
+        print(f'== {name} ==')
+        if not fn():
+            print(f'!! FAILED at {name} -- ABORT, arm holds position')
+            raise SystemExit(1)
+    print(f'== DONE in {time.time()-t_start:.0f}s ==')
+finally:
+    stop_camera_ui()
+    node.destroy_node()
+    if rclpy.ok():
+        rclpy.shutdown()
