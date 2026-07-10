@@ -33,15 +33,31 @@ CAM_WIDTH = 1280
 CAM_HEIGHT = 720
 PICK_FLOW = str(Path(__file__).resolve().parent / "pick_flow.py")
 
-MID_RGB = (33, 52, 100)
-_mid_bgr = np.uint8([[[MID_RGB[2], MID_RGB[1], MID_RGB[0]]]])
-_mid_hsv = cv2.cvtColor(_mid_bgr, cv2.COLOR_BGR2HSV)[0, 0]
-H, S, V = int(_mid_hsv[0]), int(_mid_hsv[1]), int(_mid_hsv[2])
-H_TOL, S_TOL, V_TOL = 12, 70, 70
-lo = np.array([max(0, H - H_TOL), max(40, S - S_TOL), max(30, V - V_TOL)])
-hi = np.array([min(179, H + H_TOL), 255, min(255, V + V_TOL)])
-COLOR_HSV = {"blue": [(lo, hi)]}
-DRAW_COLOR = (int(_mid_bgr[0, 0, 0]), int(_mid_bgr[0, 0, 1]), int(_mid_bgr[0, 0, 2]))
+def convert_to_hsv(Rvalue, Gvalue, Bvalue):
+    _mid_bgr = np.uint8([[[Bvalue, Gvalue, Rvalue]]])
+    _mid_hsv = cv2.cvtColor(_mid_bgr, cv2.COLOR_BGR2HSV)[0, 0]
+    H, S, V = int(_mid_hsv[0]), int(_mid_hsv[1]), int(_mid_hsv[2])
+
+    H_TOL = 12
+    S_TOL = 70
+    V_TOL = 70
+
+    lo = np.array([max(0, H - H_TOL), max(40, S - S_TOL), max(30, V - V_TOL)])
+    hi = np.array([min(179, H + H_TOL), 255, min(255, V + V_TOL)])
+    draw_color = (int(_mid_bgr[0, 0, 0]), int(_mid_bgr[0, 0, 1]), int(_mid_bgr[0, 0, 2]))
+    return lo, hi, draw_color
+
+
+blue_rgb = (33, 52, 100)
+purple_rgb = (67, 41, 65)
+yellow_rgb = (249, 222, 0)
+
+COLOR_HSV = {}
+DRAW_COLOR = {}
+for name, rgb in [("blue", blue_rgb), ("purple", purple_rgb), ("yellow", yellow_rgb)]:
+    lo, hi, draw = convert_to_hsv(*rgb)
+    COLOR_HSV[name] = [(lo, hi)]
+    DRAW_COLOR[name] = draw
 
 MIN_AREA_PX = 200
 SMOOTH_N = 3
@@ -59,20 +75,30 @@ def color_mask(frame_bgr, color="blue"):
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
     return mask
 
+def detect_block(frame, color="auto", min_area=MIN_AREA_PX):
+    colors_to_check = COLOR_HSV.keys() if color == "auto" else [color]
 
-def detect_block(frame, color="blue", min_area=MIN_AREA_PX):
-    mask = color_mask(frame, color=color)
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return None
-    contour = max(contours, key=cv2.contourArea)
-    area = float(cv2.contourArea(contour))
-    if area < min_area:
-        return None
-    M = cv2.moments(contour)
-    if M["m00"] == 0:
-        return None
-    return M["m10"] / M["m00"], M["m01"] / M["m00"], area, contour, mask
+    best = None
+    for name in colors_to_check:
+        mask = color_mask(frame, color=name)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            continue
+        contour = max(contours, key=cv2.contourArea)
+        area = float(cv2.contourArea(contour))
+        if area < min_area:
+            continue
+
+        M = cv2.moments(contour)
+        if M["m00"] == 0:
+            continue
+        cx = M["m10"] / M["m00"]
+        cy = M["m01"] / M["m00"]
+
+        if best is None or area > best[2]:
+            best = (cx, cy, area, contour, mask, name)
+
+    return best
 
 
 def run_pick_flow(px, py, rot=90.0, grip_val=28, dry_run=False):
@@ -111,7 +137,7 @@ def main():
         description="Blue block vision. Default: publish /block_position (use 2 terminals)."
     )
     parser.add_argument("--camera", type=int, default=0)
-    parser.add_argument("--color", choices=["blue"], default="blue")
+    parser.add_argument("--color", choices=["auto"] + sorted(COLOR_HSV.keys()), default="auto")
     parser.add_argument("--min-area", type=int, default=MIN_AREA_PX)
     parser.add_argument(
         "--pick",
@@ -166,11 +192,23 @@ def main():
                 break
 
             result = detect_block(frame, color=args.color, min_area=args.min_area)
-            display = frame.copy()
-            status = "no blue block"
-
-            if result is not None:
-                cx, cy, area, contour, mask = result
+            if result is None:
+                display = frame.copy()
+                debug_color = args.color if args.color != "auto" else "blue"
+                dbg = color_mask(frame, debug_color)
+                preview = cv2.cvtColor(dbg, cv2.COLOR_GRAY2BGR)
+                scale = 200 / max(preview.shape[1], 1)
+                preview = cv2.resize(
+                    preview, (int(preview.shape[1] * scale), int(preview.shape[0] * scale))
+                )
+                display[0:preview.shape[0], 0:preview.shape[1]] = preview
+                cv2.putText(
+                    display, "no blue block — check mask (top-left)",
+                    (10, preview.shape[0] + 24),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2,
+                )
+            else:
+                cx, cy, area, contour, mask , found_colour = result
                 recent.append((cx, cy))
                 sx = sum(p[0] for p in recent) / len(recent)
                 sy = sum(p[1] for p in recent) / len(recent)
