@@ -14,9 +14,11 @@ Env: ROBOT_IP overrides target robot (default 192.168.123.50)
 """
 import argparse
 import os
+import shutil
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 # RoboEnv IK dependency (needed even if shell forgot to export PYTHONPATH)
 _ROBO = os.path.expanduser("~/RoboEnv/simulation_and_control")
@@ -32,6 +34,11 @@ from geometry_msgs.msg import PointStamped
 from mycobot_client_2.ik import CobotIK
 from mycobot_msgs_2.msg import MycobotAngles, MycobotSetAngles
 from rclpy.qos import QoSProfile, ReliabilityPolicy
+
+# Same grip_set.py that hybrid_pick_place.sh / test_robot.sh use on the Pi
+_GRIP_SET_LOCAL = Path(__file__).resolve().parents[1] / "provision" / "grip_set.py"
+if not _GRIP_SET_LOCAL.is_file():
+    _GRIP_SET_LOCAL = Path(__file__).resolve().parents[2] / "provision" / "grip_set.py"
 
 DEG = np.pi / 180.0
 RAD = 180.0 / np.pi
@@ -77,13 +84,93 @@ def run_pick(px, py, rot=90.0, grasp_z=0.02, place_z=0.06, grip_val=28, speed=25
     print(f"grip_val={grip_val} (100=open, lower=tighter)")
 
     rip = robot_ip or os.environ.get("ROBOT_IP", "192.168.123.50")
-    ssh = [
-        "/usr/bin/sshpass", "-p", "Elephant", "ssh",
+    # Match hybrid_pick_place.sh: sshpass from PATH + same SSH options
+    sshpass = shutil.which("sshpass") or "/usr/bin/sshpass"
+    ssh_opts = [
         "-o", "StrictHostKeyChecking=no",
         "-o", "PreferredAuthentications=password",
         "-o", "PubkeyAuthentication=no",
-        "er@" + rip,
     ]
+    ssh = [sshpass, "-p", "Elephant", "ssh"] + ssh_opts + ["er@" + rip]
+    scp = [sshpass, "-p", "Elephant", "scp"] + ssh_opts
+    grip_ready = {"ok": False}
+
+    def ensure_grip_script():
+        """Copy provision/grip_set.py to the Pi (same as test_robot.sh)."""
+        if grip_ready["ok"]:
+            return True
+        if not _GRIP_SET_LOCAL.is_file():
+            print(f"grip: WARNING local grip_set.py missing at {_GRIP_SET_LOCAL}")
+            return True  # hope Pi already has it
+        print(f"grip: copying {_GRIP_SET_LOCAL.name} -> er@{rip}:/home/er/grip_set.py")
+        try:
+            r = subprocess.run(
+                scp + [str(_GRIP_SET_LOCAL), f"er@{rip}:/home/er/grip_set.py"],
+                capture_output=True, text=True, timeout=30,
+            )
+        except FileNotFoundError:
+            print(f"grip: FAILED — sshpass not found ({sshpass})")
+            return False
+        if r.returncode != 0:
+            print("grip: FAILED scp grip_set.py:", (r.stderr or r.stdout or "").strip())
+            return False
+        grip_ready["ok"] = True
+        return True
+
+    def grip(v, sp):
+        """Partial-close via SSH + pymycobot — same action as hybrid_pick_place.sh."""
+        if not ensure_grip_script():
+            return False
+        print(f"grip: SSH er@{rip}  grip_set.py {v} {sp}  (hybrid-style)")
+        # Same remote sequence as hybrid_pick_place.sh grip()
+        sh = (
+            f"echo 'grip->{v} boot='$(uptime -s); "
+            f"docker stop -t 2 mycobot_comms>/dev/null 2>&1; "
+            f"python3 /home/er/grip_set.py {v} {sp}; "
+            f"echo 'boot_after='$(uptime -s); "
+            f"docker start mycobot_comms>/dev/null 2>&1"
+        )
+        try:
+            r = subprocess.run(ssh + [sh], capture_output=True, text=True, timeout=90)
+        except FileNotFoundError:
+            print(f"grip: FAILED — sshpass not found ({sshpass}). sudo apt install sshpass")
+            return False
+        except subprocess.TimeoutExpired:
+            print("grip: FAILED — SSH timed out (check ROBOT_IP / Pi network)")
+            return False
+
+        out = (r.stdout or "").strip()
+        err = (r.stderr or "").strip()
+        # hybrid filters these; still show useful lines
+        for line in out.splitlines():
+            if "Permission denied" in line or line.startswith("Warning:"):
+                continue
+            print(" ", line)
+        if err:
+            for line in err.splitlines():
+                if "Permission denied" in line or "Warning:" in line:
+                    continue
+                print(" grip stderr:", line)
+
+        if r.returncode != 0:
+            print(f"grip: FAILED exit={r.returncode} ROBOT_IP={rip}")
+            return False
+        if "grip" not in out.lower() and "set->" not in out:
+            print("grip: FAILED — no gripper output (is Pi reachable? is grip_set.py on Pi?)")
+            return False
+
+        boots = [l.split("=", 1)[1] for l in out.splitlines() if "boot" in l and "=" in l]
+        if len(boots) >= 2 and boots[0] != boots[-1]:
+            print("grip: PI REBOOTED during grip")
+            return False
+
+        # hybrid_pick_place.sh waits here so gripper finishes + docker comes back
+        time.sleep(5)
+        if fresh(20) is None:
+            print("grip: comms did not come back after docker start")
+            return False
+        print(f"grip: OK -> {v}")
+        return True
 
     if not rclpy.ok():
         rclpy.init()
@@ -113,7 +200,7 @@ def run_pick(px, py, rot=90.0, grasp_z=0.02, place_z=0.06, grip_val=28, speed=25
     node.create_subscription(PointStamped, "/block_position", block_callback, BLOCK_QOS)
     print(
         f"pick_flow ready | vision={use_vision} | "
-        f"ROS_DOMAIN_ID={os.environ.get('ROS_DOMAIN_ID', '0')} | ROBOT_IP={rip}"
+        f"ROS_DOMAIN_ID={os.environ.get('ROS_DOMAIN_ID', '0')} | ROBOT_IP={rip} | sshpass={sshpass}"
     )
 
     def fresh(t=4.0):
@@ -153,51 +240,6 @@ def run_pick(px, py, rot=90.0, grasp_z=0.02, place_z=0.06, grip_val=28, speed=25
         ok = goto(np.zeros(6), spd, 4.0, 25.0)
         print("home:", "OK" if ok else "TIMEOUT")
         return ok
-
-    def grip(v, sp):
-        print(f"grip: SSH er@{rip} set_gripper_value({v}, {sp})")
-        sh = (
-            f"echo '  grip boot='$(uptime -s); "
-            f"docker stop -t 2 mycobot_comms>/dev/null 2>&1; "
-            f"if [ ! -f /home/er/grip_set.py ]; then echo '  ERROR: missing /home/er/grip_set.py'; exit 2; fi; "
-            f"python3 /home/er/grip_set.py {v} {sp}; "
-            f"rc=$?; "
-            f"docker start mycobot_comms>/dev/null 2>&1; "
-            f"echo '  boot_after='$(uptime -s); "
-            f"exit $rc"
-        )
-        try:
-            r = subprocess.run(ssh + [sh], capture_output=True, text=True, timeout=90)
-        except FileNotFoundError:
-            print("grip: FAILED — sshpass not found. Install: sudo apt install sshpass")
-            return False
-        except subprocess.TimeoutExpired:
-            print("grip: FAILED — SSH timed out (wrong ROBOT_IP or Pi unreachable?)")
-            return False
-
-        out = (r.stdout or "").strip()
-        err = (r.stderr or "").strip()
-        if out:
-            print(out)
-        if err:
-            print("grip stderr:", err)
-        if r.returncode != 0:
-            print(f"grip: FAILED — SSH/grip_set exit {r.returncode} (ROBOT_IP={rip})")
-            print("  tip: export ROBOT_IP=<pi-ip> and ensure /home/er/grip_set.py exists on the Pi")
-            print("  tip: from laptop: ./test_robot.sh  (copies grip_set.py and checks gripper)")
-            return False
-        if "grip set" not in out and "grip before" not in out:
-            print("grip: FAILED — no gripper feedback from Pi (SSH may have failed silently)")
-            return False
-        boots = [l.split("=", 1)[1] for l in out.splitlines() if "boot" in l and "=" in l]
-        if len(boots) == 2 and boots[0] != boots[1]:
-            print("grip: PI REBOOTED")
-            return False
-        if fresh(20) is None:
-            print("grip: comms did not come back")
-            return False
-        print(f"grip: OK -> {v}")
-        return True
 
     def wait_for_vision(timeout=60.0):
         print("waiting for /block_position from vision...")

@@ -20,18 +20,20 @@ import cv2
 # ---------------------------------------------------------------------------
 # Calibration data (edit here if you re-calibrate)
 # ---------------------------------------------------------------------------
-# Original coordinates in cm (robot / world frame)
+# CM: (lateral_cm, forward_cm)  — robot Y, robot X
+# PX: (u, v) camera pixels
 CM_POINTS = np.array([
-    (-15.5, 24), (4, 25), (-24, 16), (-5, 17), (12, 19),
-    (-15.5, 9), (4.5, 9), (19.5, 9), (-5, 5), (-24, -1),
-    (0, 0), (12.5, 0), (27.5, 0)
+    (-16.0, 0.0), (0.0, 0.0), (16.0, 0.0),
+    (-6.0, 7.5), (8.0, 8.0),
+    (-16.0, 13.5), (0.0, 15.0), (16.0, 15.0),
+    (-9.0, 20.0), (9.0, 20.0),
 ], dtype=np.float64)
 
-# Corresponding transformed coordinates in px (camera / image frame)
 PX_POINTS = np.array([
-    (1039, 618), (450, 647), (1174, 484), (701, 531), (274, 527),
-    (900, 407), (496, 409), (178, 406), (679, 374), (1006, 332),
-    (600, 332), (371, 339), (115, 334)
+    (945, 310), (647, 321), (352, 314),
+    (791, 401), (467, 408),
+    (1051, 471), (647, 511), (223, 513),
+    (384, 633), (933, 603),
 ], dtype=np.float64)
 
 # Homography: pixel -> cm (swap src/dst if you need cm -> px instead)
@@ -54,8 +56,8 @@ def pixel_to_meters(x_px, y_px):
 
 
 if __name__ == '__main__':
-    # Example usage — calibration pair (600, 332) <-> (0, 0) cm
-    x_in, y_in = 600, 332
+    # Example — calibration pair (647, 321) <-> (0, 0) cm
+    x_in, y_in = 647, 321
     x_out, y_out = pixel_to_cm(x_in, y_in)
     xf, yf = pixel_to_meters(x_in, y_in)
     print(f'px=({x_in}, {y_in}) -> cm=({x_out:.2f}, {y_out:.2f})')
