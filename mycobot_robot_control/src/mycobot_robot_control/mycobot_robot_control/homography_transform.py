@@ -33,7 +33,7 @@ PX_POINTS = np.array([
     (945, 310), (647, 321), (352, 314),
     (791, 401), (467, 408),
     (1051, 471), (647, 511), (223, 513),
-    (384, 633), (933, 603),
+    (933, 603), (384, 633),
 ], dtype=np.float64)
 
 # Homography: pixel -> cm (swap src/dst if you need cm -> px instead)

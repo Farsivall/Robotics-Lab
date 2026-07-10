@@ -18,6 +18,7 @@ import shutil
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 # RoboEnv IK dependency (needed even if shell forgot to export PYTHONPATH)
 _ROBO = os.path.expanduser("~/RoboEnv/simulation_and_control")
@@ -45,6 +46,10 @@ BLOCK_QOS = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE)
 # Hardcoded claw values (hybrid_pick_place.sh style)
 GRIP_OPEN = 100
 GRIP_CLOSE = 28
+# grip_set.py we scp to the Pi before gripping (same file test_robot.sh uses)
+_GRIP_SET_LOCAL = Path(__file__).resolve().parents[1] / "provision" / "grip_set.py"
+if not _GRIP_SET_LOCAL.is_file():
+    _GRIP_SET_LOCAL = Path(__file__).resolve().parents[2] / "provision" / "grip_set.py"
 
 
 def parse_args(argv=None):
@@ -82,13 +87,14 @@ def run_pick(px, py, rot=90.0, grasp_z=0.02, place_z=0.06, grip_val=None, speed=
     if os.path.isdir(_mf):
         os.environ["PATH"] = _mf + os.pathsep + os.environ.get("PATH", "")
     sshpass = shutil.which("sshpass") or "/usr/bin/sshpass"
-    ssh = [
-        sshpass, "-p", "Elephant", "ssh",
+    _opts = [
         "-o", "StrictHostKeyChecking=no",
         "-o", "PreferredAuthentications=password",
         "-o", "PubkeyAuthentication=no",
-        "er@" + rip,
     ]
+    ssh = [sshpass, "-p", "Elephant", "ssh"] + _opts + ["er@" + rip]
+    scp = [sshpass, "-p", "Elephant", "scp"] + _opts
+    grip_ready = {"ok": False}
 
     if not rclpy.ok():
         rclpy.init()
@@ -159,9 +165,37 @@ def run_pick(px, py, rot=90.0, grasp_z=0.02, place_z=0.06, grip_val=None, speed=
         print("home:", "OK" if ok else "TIMEOUT")
         return ok
 
+    def ensure_grip_script():
+        """Copy provision/grip_set.py to the Pi so the claw script is present."""
+        if grip_ready["ok"]:
+            return True
+        if not _GRIP_SET_LOCAL.is_file():
+            print(f"grip: local grip_set.py missing at {_GRIP_SET_LOCAL} — hoping Pi has it")
+            grip_ready["ok"] = True
+            return True
+        try:
+            r = subprocess.run(
+                scp + [str(_GRIP_SET_LOCAL), f"er@{rip}:/home/er/grip_set.py"],
+                capture_output=True, text=True, timeout=30,
+            )
+        except FileNotFoundError:
+            print(f"grip: FAILED — sshpass not found ({sshpass}). sudo apt install sshpass")
+            return False
+        except subprocess.TimeoutExpired:
+            print(f"grip: FAILED — scp timed out (check ROBOT_IP={rip} / network)")
+            return False
+        if r.returncode != 0:
+            print("grip: FAILED to copy grip_set.py:", (r.stderr or r.stdout or "").strip())
+            return False
+        grip_ready["ok"] = True
+        return True
+
     # Hardcoded open/close — same remote command as hybrid_pick_place.sh
     def grip(v, sp):
-        print(f"grip: set {v} speed {sp}")
+        action = "OPEN" if v >= 90 else "CLOSE"
+        print(f"grip: {action} value={v} speed={sp} via er@{rip}")
+        if not ensure_grip_script():
+            return False
         sh = (
             f"docker stop -t 2 mycobot_comms>/dev/null 2>&1; "
             f"python3 /home/er/grip_set.py {v} {sp}; "
@@ -169,15 +203,25 @@ def run_pick(px, py, rot=90.0, grasp_z=0.02, place_z=0.06, grip_val=None, speed=
         )
         try:
             r = subprocess.run(ssh + [sh], capture_output=True, text=True, timeout=90)
-            if r.stdout:
-                print(r.stdout.strip())
-            if r.stderr:
-                print(r.stderr.strip())
-        except Exception as e:
-            print(f"grip: SSH error: {e}")
+        except FileNotFoundError:
+            print(f"grip: FAILED — sshpass not found ({sshpass}). sudo apt install sshpass")
             return False
-        time.sleep(5)
+        except subprocess.TimeoutExpired:
+            print(f"grip: FAILED — SSH timed out (check ROBOT_IP={rip} / network)")
+            return False
+        out = ((r.stdout or "") + "\n" + (r.stderr or "")).strip()
+        for line in out.splitlines():
+            if line.strip() and "Permission denied" not in line and "Warning:" not in line:
+                print(" ", line)
+        # grip_set.py prints "grip before:" / "grip set->"; if absent, it never ran
+        if "grip before:" not in out and "grip set->" not in out:
+            print("grip: FAILED — grip_set.py produced no output (claw did NOT move)")
+            print(f"  check: ROBOT_IP={rip}, Pi reachable, /home/er/grip_set.py exists")
+            print("  from laptop:  ./test_robot.sh")
+            return False
+        time.sleep(5)  # let the claw finish + comms come back
         fresh(20)
+        print(f"grip: OK {action} -> {v}")
         return True
 
     def wait_for_vision(timeout=60.0):
