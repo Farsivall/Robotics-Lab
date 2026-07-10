@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-"""Detect blue block, then either publish ROS topic OR launch pick_flow with args.
+"""Detect blue block and publish /block_position for pick_flow (two terminals).
 
-Recommended (no hang): detect → call pick_flow.py PX PY as subprocess.
+Easy two-terminal flow (no --pick needed):
+  Terminal 1:  ./vision.sh          # or: python cam_to_coord.py
+  Terminal 2:  ./pick_vision.sh     # or: python pick_flow.py --vision
 
-  python cam_to_coord.py --pick          # detect then move arm (best)
-  python cam_to_coord.py                 # publish /block_position only
-  python cam_to_coord.py --stream        # keep publishing (debug)
+Optional:
   python cam_to_coord.py --camera 1
+  python cam_to_coord.py --pick     # one-terminal: detect then launch pick_flow
 
-Env: ROS_DOMAIN_ID=10 when using topic mode; --pick does not need a second terminal.
+Env: ROS_DOMAIN_ID should be 10 on both terminals.
 """
 import argparse
 import os
@@ -43,8 +44,7 @@ COLOR_HSV = {"blue": [(lo, hi)]}
 DRAW_COLOR = (int(_mid_bgr[0, 0, 0]), int(_mid_bgr[0, 0, 1]), int(_mid_bgr[0, 0, 2]))
 
 MIN_AREA_PX = 200
-SMOOTH_N = 5
-HANDOFF_BURSTS = 8
+SMOOTH_N = 3
 BLOCK_QOS = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE)
 
 
@@ -76,11 +76,7 @@ def detect_block(frame, color="blue", min_area=MIN_AREA_PX):
 
 
 def run_pick_flow(px, py, rot=90.0, dry_run=False):
-    """Call pick_flow.py with PX PY args — no ROS topic wait."""
-    cmd = [
-        sys.executable, PICK_FLOW,
-        f"{px:.4f}", f"{py:.4f}", f"{rot:.1f}",
-    ]
+    cmd = [sys.executable, PICK_FLOW, f"{px:.4f}", f"{py:.4f}", f"{rot:.1f}"]
     print("->", " ".join(cmd), flush=True)
     if dry_run:
         return True
@@ -92,7 +88,7 @@ class BlockPublisher(Node):
         super().__init__("cam_to_coord")
         self.pub = self.create_publisher(PointStamped, "/block_position", BLOCK_QOS)
         self.get_logger().info(
-            f"ready | ROS_DOMAIN_ID={os.environ.get('ROS_DOMAIN_ID', '0')}"
+            f"publishing /block_position | ROS_DOMAIN_ID={os.environ.get('ROS_DOMAIN_ID', '0')}"
         )
 
     def publish_xy(self, x, y):
@@ -107,20 +103,25 @@ class BlockPublisher(Node):
 
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="Blue block vision. Default: publish /block_position (use 2 terminals)."
+    )
     parser.add_argument("--camera", type=int, default=0)
     parser.add_argument("--color", choices=["blue"], default="blue")
     parser.add_argument("--min-area", type=int, default=MIN_AREA_PX)
-    parser.add_argument("--stream", action="store_true",
-                        help="keep publishing forever (topic debug)")
-    parser.add_argument("--pick", action="store_true",
-                        help="after lock, run pick_flow.py PX PY (recommended)")
-    parser.add_argument("--dry-run", action="store_true",
-                        help="with --pick, only print the pick_flow command")
-    parser.add_argument("--rot", type=float, default=90.0, help="ROT passed to pick_flow")
+    parser.add_argument(
+        "--pick",
+        action="store_true",
+        help="optional one-terminal mode: after lock, run pick_flow.py PX PY",
+    )
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--rot", type=float, default=90.0)
     parser.add_argument("--rate", type=float, default=10.0)
     parser.add_argument("--width", type=int, default=CAM_WIDTH)
     parser.add_argument("--height", type=int, default=CAM_HEIGHT)
+    # accept old flag names so older habit / docs don't error
+    parser.add_argument("--stream", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--once", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
 
     cap = cv2.VideoCapture(args.camera)
@@ -130,30 +131,26 @@ def main():
 
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
-    mode = "PICK (args)" if args.pick else ("STREAM" if args.stream else "TOPIC handoff")
     print(
-        f"Camera {args.camera} | color=blue | mode={mode} | "
+        f"Camera {args.camera} | blue | "
+        f"mode={'PICK' if args.pick else 'TWO-TERMINAL publish'} | "
         f"ROS_DOMAIN_ID={os.environ.get('ROS_DOMAIN_ID', '0')}"
     )
     if args.pick:
-        print("Will lock blue block then: python pick_flow.py PX PY ...")
+        print("Will lock then launch pick_flow with PX PY args.")
     else:
-        print("Publishing /block_position — start pick_flow --vision in other terminal.")
+        print("Publishing /block_position continuously.")
+        print("In OTHER terminal run:  ./pick_vision.sh   OR   python pick_flow.py --vision")
     print("Press q to quit.")
 
-    need_ros = not args.pick or args.stream
     node = None
-    if need_ros or not args.pick:
+    if not args.pick:
         rclpy.init()
         node = BlockPublisher()
         time.sleep(1.0)
 
     period = 1.0 / max(args.rate, 0.1)
     recent = deque(maxlen=SMOOTH_N)
-    bursts_left = HANDOFF_BURSTS
-    handed_off = False
-    last_xy = None
-    last_pub_slow = 0.0
     pick_started = False
 
     try:
@@ -166,20 +163,12 @@ def main():
             display = frame.copy()
             status = "no blue block"
 
-            if result is None:
-                recent.clear()
-                if handed_off and last_xy is not None and node is not None and not args.pick:
-                    if time.time() - last_pub_slow >= 1.0:
-                        node.publish_xy(last_xy[0], last_xy[1])
-                        last_pub_slow = time.time()
-                    status = "HANDOFF DONE — re-PUB 1Hz"
-            else:
+            if result is not None:
                 cx, cy, area, contour, mask = result
                 recent.append((cx, cy))
                 sx = sum(p[0] for p in recent) / len(recent)
                 sy = sum(p[1] for p in recent) / len(recent)
                 x, y = pixel_to_meters(sx, sy)
-                last_xy = (x, y)
 
                 cv2.drawContours(display, [contour], -1, DRAW_COLOR, 2)
                 cv2.circle(display, (int(sx), int(sy)), 10, (0, 255, 0), -1)
@@ -198,49 +187,21 @@ def main():
                 stable = len(recent) >= SMOOTH_N
                 if args.pick and stable and not pick_started:
                     pick_started = True
-                    handed_off = True
-                    print(f"LOCKED x={x:.3f} y={y:.3f} — launching pick_flow with args", flush=True)
-                    cv2.putText(
-                        display, "LAUNCHING PICK...", (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2,
-                    )
-                    cv2.imshow("cam_to_coord", display)
-                    cv2.waitKey(1)
-                    # release camera before pick (USB cam often exclusive)
+                    print(f"LOCKED x={x:.3f} y={y:.3f} — launching pick_flow", flush=True)
                     cap.release()
                     cv2.destroyAllWindows()
-                    if node is not None:
-                        node.destroy_node()
-                        rclpy.shutdown()
-                        node = None
                     ok = run_pick_flow(x, y, rot=args.rot, dry_run=args.dry_run)
                     print("pick_flow:", "OK" if ok else "FAILED")
                     raise SystemExit(0 if ok else 1)
 
-                if args.stream and node is not None:
+                if not args.pick and stable and node is not None:
                     node.publish_xy(x, y)
-                    status = "STREAM publishing"
-                elif not args.pick and not handed_off and stable and node is not None:
-                    node.publish_xy(x, y)
-                    bursts_left -= 1
-                    status = f"handoff {HANDOFF_BURSTS - bursts_left}/{HANDOFF_BURSTS}"
-                    if bursts_left <= 0:
-                        handed_off = True
-                        last_pub_slow = time.time()
-                        print(f"HANDOFF DONE x={x:.3f} y={y:.3f}", flush=True)
-                elif handed_off and not args.pick and node is not None:
-                    if time.time() - last_pub_slow >= 1.0:
-                        node.publish_xy(last_xy[0], last_xy[1])
-                        last_pub_slow = time.time()
-                    status = "HANDOFF DONE — re-PUB 1Hz"
+                    status = "PUBLISHING"
                 else:
                     status = f"locking... {len(recent)}/{SMOOTH_N}"
+            else:
+                recent.clear()
 
-            if last_xy and handed_off:
-                cv2.putText(
-                    display, "LOCKED", (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2,
-                )
             cv2.putText(
                 display, status, (10, display.shape[0] - 16),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2,
