@@ -38,22 +38,27 @@ from homography_transform import pixel_to_meters
 CAM_WIDTH = 1280
 CAM_HEIGHT = 720
 
-# HSV ranges (OpenCV H: 0-179). Red wraps around 0.
+# Compute HSV range from midpoint RGB=(33,52,100) with tolerances so detection is centered
+MID_RGB = (33, 52, 100)  # (R, G, B) midpoint provided
+_mid_bgr = np.uint8([[[MID_RGB[2], MID_RGB[1], MID_RGB[0]]]])  # convert to BGR for OpenCV
+_mid_hsv = cv2.cvtColor(_mid_bgr, cv2.COLOR_BGR2HSV)[0, 0]
+H, S, V = int(_mid_hsv[0]), int(_mid_hsv[1]), int(_mid_hsv[2])
+
+# Tolerances (adjust if you need wider/narrower matching)
+H_TOL = 10
+S_TOL = 60
+V_TOL = 60
+
+lo = np.array([max(0, H - H_TOL), max(50, S - S_TOL), max(40, V - V_TOL)])
+hi = np.array([min(179, H + H_TOL), 255, min(255, V + V_TOL)])
 COLOR_HSV = {
-    '''
-    "red": [
-        (np.array([0, 80, 60]), np.array([10, 255, 255])),
-        (np.array([160, 80, 60]), np.array([179, 255, 255])),
-    ],
-    "green": [
-        (np.array([40, 60, 40]), np.array([85, 255, 255])),
-    ],
-    '''
-    
     "blue": [
-        (np.array([95, 60, 40]), np.array([130, 255, 255])),
+        (lo, hi),
     ],
 }
+
+# Use the original BGR midpoint for drawing on the frame
+DRAW_COLOR = (int(_mid_bgr[0, 0, 0]), int(_mid_bgr[0, 0, 1]), int(_mid_bgr[0, 0, 2]))
 
 MIN_AREA_PX = 400          # ignore tiny noise blobs
 SMOOTH_N = 5               # average last N centroids for stable publish
@@ -120,8 +125,8 @@ class BlockPublisher(Node):
 def main():
     parser = argparse.ArgumentParser(description="Detect colored block and publish /block_position")
     parser.add_argument("--camera", type=int, default=0, help="webcam index")
-    parser.add_argument("--color", choices=sorted(COLOR_HSV.keys()), default="red",
-                        help="block color to detect (default: red)")
+    parser.add_argument("--color", choices=sorted(COLOR_HSV.keys()), default="blue",
+                        help="block color to detect (default: blue)")
     parser.add_argument("--min-area", type=int, default=MIN_AREA_PX, help="min contour area px")
     parser.add_argument("--once", action="store_true", help="publish one detection then exit")
     parser.add_argument("--rate", type=float, default=5.0, help="loop rate Hz")
@@ -144,7 +149,7 @@ def main():
         print(f"WARNING: requested {args.width}x{args.height} but got {actual_w}x{actual_h}; "
               f"homography may be off — recalibrate or pass --width/--height")
 
-    print("Place the red block in view. Press q to quit.")
+    print("Place the blue block in view. Press q to quit.")
 
     rclpy.init()
     node = BlockPublisher()
@@ -175,13 +180,13 @@ def main():
                 published = True
 
                 display = frame.copy()
-                cv2.drawContours(display, [contour], -1, (0, 255, 0), 2)
-                cv2.circle(display, (int(sx), int(sy)), 8, (0, 255, 0), 2)
+                cv2.drawContours(display, [contour], -1, DRAW_COLOR, 2)
+                cv2.circle(display, (int(sx), int(sy)), 8, DRAW_COLOR, 2)
                 cv2.putText(
                     display,
                     f"{args.color} ({x:.3f}, {y:.3f}) m  area={int(area)}",
                     (int(sx) + 12, int(sy) - 12),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2,
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, DRAW_COLOR, 2,
                 )
                 # Small mask preview (top-left)
                 preview = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
