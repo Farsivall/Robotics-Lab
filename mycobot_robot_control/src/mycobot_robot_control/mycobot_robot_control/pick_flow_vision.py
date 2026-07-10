@@ -10,13 +10,13 @@ discovery race.
 Sequence: vision -> home -> open -> approach -> descend -> partial close ->
           lift -> rotate J1 -> place descend -> open -> retreat -> home.
 
-Usage: python pick_flow.py [PX PY ROT [GRASP_Z PLACE_Z GRIP_VAL SPEED]]
-       defaults: 0.18 0 90 0.02 0.06 35 25
+Usage: python pick_flow_vision.py [PX PY ROT [GRASP_Z PLACE_Z GRIP_VAL SPEED]]
+       defaults: 0.18 0 90 0.02 0.06 28 25
        omit PX/PY to use the webcam instead (default behavior)
 Env:   ROBOT_IP     overrides target robot (default 192.168.123.50)
        CAMERA_INDEX overrides cv2.VideoCapture index (default 0)
 """
-import os, subprocess, sys, time
+import os, shutil, subprocess, sys, time
 from collections import deque
 from pathlib import Path
 
@@ -40,7 +40,7 @@ PY = float(a[1]) if len(a) > 1 else 0.0
 ROT = float(a[2]) if len(a) > 2 else 90.0
 GZ = float(a[3]) if len(a) > 3 else 0.02
 PZ = float(a[4]) if len(a) > 4 else 0.06
-GV = int(a[5]) if len(a) > 5 else 35
+GV = int(a[5]) if len(a) > 5 else 28
 SP = int(a[6]) if len(a) > 6 else 25
 
 DEG = np.pi / 180.0; RAD = 180.0 / np.pi
@@ -48,9 +48,21 @@ LIMS = np.array([165, 165, 165, 165, 165, 179.0])
 DOWN = np.array([180.0, 0.0, 0.0])
 LIFT = 0.10; APPR = 0.04; STEP = 0.01
 RIP = os.environ.get('ROBOT_IP', '192.168.123.50')
-SSH = ['/usr/bin/sshpass', '-p', 'Elephant', 'ssh', '-o', 'StrictHostKeyChecking=no',
-       '-o', 'PreferredAuthentications=password', '-o', 'PubkeyAuthentication=no', 'er@' + RIP]
+_mf = os.path.expanduser('~/miniforge3/bin')
+if os.path.isdir(_mf):
+    os.environ['PATH'] = _mf + os.pathsep + os.environ.get('PATH', '')
+SSHPASS = shutil.which('sshpass') or '/usr/bin/sshpass'
+SSH_OPTS = ['-o', 'StrictHostKeyChecking=no',
+            '-o', 'PreferredAuthentications=password',
+            '-o', 'PubkeyAuthentication=no']
+SSH = [SSHPASS, '-p', 'Elephant', 'ssh'] + SSH_OPTS + ['er@' + RIP]
+SCP = [SSHPASS, '-p', 'Elephant', 'scp'] + SSH_OPTS
+_GRIP_SET_LOCAL = Path(__file__).resolve().parents[1] / 'provision' / 'grip_set.py'
+if not _GRIP_SET_LOCAL.is_file():
+    _GRIP_SET_LOCAL = Path(__file__).resolve().parents[2] / 'provision' / 'grip_set.py'
+_grip_ready = False
 if GV < 25: print('GRIP_VAL < 25 risks stall-current brownout'); raise SystemExit(2)
+print(f'grip_val={GV} (100=open, lower=tighter)')
 
 # ---------------------------------------------------------------------------
 # Vision (formerly cam_to_coord.py) -- pure OpenCV, no ROS involved.
@@ -218,17 +230,78 @@ def home(speed=30):
     ok = goto(np.zeros(6), speed, 4.0, 25.0)
     print('home:', 'OK' if ok else 'TIMEOUT'); return ok
 
-def grip(v, sp):
-    sh = (f"echo '  grip boot='$(uptime -s); docker stop -t 2 mycobot_comms>/dev/null 2>&1; "
-          f"python3 /home/er/grip_set.py {v} {sp}; docker start mycobot_comms>/dev/null 2>&1; "
-          f"echo '  boot_after='$(uptime -s)")
-    r = subprocess.run(SSH + [sh], capture_output=True, text=True, timeout=90)
-    out = r.stdout.strip()
-    print(out)
-    boots = [l.split('=', 1)[1] for l in out.splitlines() if 'boot' in l and '=' in l]
-    if len(boots) == 2 and boots[0] != boots[1]: print('grip: PI REBOOTED'); return False
-    if fresh(20) is None: print('grip: comms did not come back'); return False
+def ensure_grip_script():
+    global _grip_ready
+    if _grip_ready:
+        return True
+    if not _GRIP_SET_LOCAL.is_file():
+        print(f'grip: WARNING local grip_set.py missing at {_GRIP_SET_LOCAL}')
+        return True
+    print(f'grip: copying {_GRIP_SET_LOCAL.name} -> er@{RIP}:/home/er/grip_set.py')
+    try:
+        r = subprocess.run(
+            SCP + [str(_GRIP_SET_LOCAL), f'er@{RIP}:/home/er/grip_set.py'],
+            capture_output=True, text=True, timeout=30,
+        )
+    except FileNotFoundError:
+        print(f'grip: FAILED — sshpass not found ({SSHPASS})')
+        return False
+    if r.returncode != 0:
+        print('grip: FAILED scp:', (r.stderr or r.stdout or '').strip())
+        return False
+    _grip_ready = True
     return True
+
+def grip(v, sp):
+    """Same open/close path as hybrid_pick_place.sh (SSH + grip_set.py + sleep 5)."""
+    if not ensure_grip_script():
+        return False
+    action = 'OPEN' if v >= 90 else 'CLOSE'
+    print(f'grip: {action}  value={v} speed={sp}  via er@{RIP} grip_set.py')
+    sh = (
+        f"echo 'grip->{v} boot='$(uptime -s); "
+        f"docker stop -t 2 mycobot_comms>/dev/null 2>&1; "
+        f"python3 /home/er/grip_set.py {v} {sp}; rc=$?; "
+        f"echo 'boot_after='$(uptime -s); "
+        f"docker start mycobot_comms>/dev/null 2>&1; "
+        f"exit $rc"
+    )
+    try:
+        r = subprocess.run(SSH + [sh], capture_output=True, text=True, timeout=90)
+    except FileNotFoundError:
+        print(f'grip: FAILED — sshpass not found ({SSHPASS})')
+        return False
+    except subprocess.TimeoutExpired:
+        print('grip: FAILED — SSH timed out')
+        return False
+    out = ((r.stdout or '') + '\n' + (r.stderr or '')).strip()
+    for line in out.splitlines():
+        if 'Permission denied' in line or 'Warning:' in line:
+            continue
+        if line.strip():
+            print(' ', line)
+    if 'grip before:' not in out and 'grip set->' not in out:
+        print('grip: FAILED — grip_set.py did not run (claw will not move)')
+        print(f'  tip: export ROBOT_IP=<pi-ip>  (current={RIP})')
+        return False
+    if r.returncode != 0:
+        print(f'grip: FAILED exit={r.returncode}')
+        return False
+    boots = [l.split('=', 1)[1] for l in out.splitlines() if 'boot' in l and '=' in l]
+    if len(boots) >= 2 and boots[0] != boots[-1]:
+        print('grip: PI REBOOTED during grip')
+        return False
+    time.sleep(5)  # hybrid always waits here
+    if fresh(25) is None:
+        print('grip: WARNING angles not back yet — continuing')
+    print(f'grip: OK {action} -> {v}')
+    return True
+
+def open_gripper():
+    return grip(100, 40)
+
+def close_gripper():
+    return grip(GV, 15)
 
 def approach_pick():
     px, py = (PX, PY) if not USE_VISION else (target['x'], target['y'])
@@ -302,14 +375,14 @@ def vision_step():
 steps = [
     ('vision',        vision_step),
     ('home',          lambda: home()),
-    ('open',          lambda: grip(100, 40)),
+    ('open',          open_gripper),       # hybrid: grip 100 40
     ('approach',      approach_pick),
     ('descend',       lambda: move_z(GZ, 15)),
-    ('grip',          lambda: grip(GV, 15)),
+    ('grip',          close_gripper),      # hybrid: grip $GV 15
     ('lift',          lambda: move_z(LIFT, SP)),
     ('rotate',        lambda: rotate(ROT)),
     ('place-descend', lambda: move_z(PZ, SP)),
-    ('release',       lambda: grip(100, 40)),
+    ('release',       open_gripper),       # hybrid: grip 100 40
     ('retreat',       lambda: move_z(0.12, SP)),
     ('home-end',      lambda: home()),
 ]
