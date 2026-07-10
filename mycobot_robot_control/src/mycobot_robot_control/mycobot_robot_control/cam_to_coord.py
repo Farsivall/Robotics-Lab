@@ -1,14 +1,11 @@
 #!/usr/bin/env python3
 """Person 2+3: detect blue block, apply homography, publish for pick_flow.
 
-Publishes geometry_msgs/PointStamped on /block_position with latched QoS so
-pick_flow can join late and still get the last detection.
+Default mode: wait until detection is stable, publish a few times, then STOP
+publishing so pick_flow can take the pose and move the arm.
 
-Blue HSV is tuned from measured midpoint RGB=(33, 52, 100).
-
-Usage:
-  python cam_to_coord.py              # default: blue
-  python cam_to_coord.py --once
+  python cam_to_coord.py              # one-shot handoff (recommended)
+  python cam_to_coord.py --stream     # keep publishing (debug only)
   python cam_to_coord.py --camera 1
 
 Env: ROS_DOMAIN_ID must match pick_flow (usually 10).
@@ -25,7 +22,7 @@ import numpy as np
 import rclpy
 from geometry_msgs.msg import PointStamped
 from rclpy.node import Node
-from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+from rclpy.qos import QoSProfile, ReliabilityPolicy
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from homography_transform import pixel_to_meters
@@ -33,32 +30,24 @@ from homography_transform import pixel_to_meters
 CAM_WIDTH = 1280
 CAM_HEIGHT = 720
 
-# Blue HSV from measured midpoint RGB=(33, 52, 100) — friend's calibration
 MID_RGB = (33, 52, 100)
 _mid_bgr = np.uint8([[[MID_RGB[2], MID_RGB[1], MID_RGB[0]]]])
 _mid_hsv = cv2.cvtColor(_mid_bgr, cv2.COLOR_BGR2HSV)[0, 0]
 H, S, V = int(_mid_hsv[0]), int(_mid_hsv[1]), int(_mid_hsv[2])
 
-H_TOL = 12
-S_TOL = 70
-V_TOL = 70
-
+H_TOL, S_TOL, V_TOL = 12, 70, 70
 lo = np.array([max(0, H - H_TOL), max(40, S - S_TOL), max(30, V - V_TOL)])
 hi = np.array([min(179, H + H_TOL), 255, min(255, V + V_TOL)])
-COLOR_HSV = {
-    "blue": [(lo, hi)],
-}
+COLOR_HSV = {"blue": [(lo, hi)]}
 DRAW_COLOR = (int(_mid_bgr[0, 0, 0]), int(_mid_bgr[0, 0, 1]), int(_mid_bgr[0, 0, 2]))
 
 MIN_AREA_PX = 200
-SMOOTH_N = 3
+SMOOTH_N = 5
+# Publish several times so DDS discovery can catch up, then stop (one-shot mode)
+HANDOFF_BURSTS = 8
 
-# Late-joining pick_flow still receives last pose (fixes hang)
-BLOCK_QOS = QoSProfile(
-    depth=10,
-    reliability=ReliabilityPolicy.RELIABLE,
-    durability=DurabilityPolicy.TRANSIENT_LOCAL,
-)
+# Volatile + reliable: compatible with pick_flow; continuous stream not required
+BLOCK_QOS = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE)
 
 
 def color_mask(frame_bgr, color="blue"):
@@ -85,22 +74,15 @@ def detect_block(frame, color="blue", min_area=MIN_AREA_PX):
     M = cv2.moments(contour)
     if M["m00"] == 0:
         return None
-    cx = M["m10"] / M["m00"]
-    cy = M["m01"] / M["m00"]
-    return cx, cy, area, contour, mask
-
-
-def pixel_to_table(cx, cy):
-    return pixel_to_meters(cx, cy)
+    return M["m10"] / M["m00"], M["m01"] / M["m00"], area, contour, mask
 
 
 class BlockPublisher(Node):
     def __init__(self):
         super().__init__("cam_to_coord")
         self.pub = self.create_publisher(PointStamped, "/block_position", BLOCK_QOS)
-        domain = os.environ.get("ROS_DOMAIN_ID", "0")
         self.get_logger().info(
-            f"publishing /block_position (latched) | ROS_DOMAIN_ID={domain}"
+            f"ready | ROS_DOMAIN_ID={os.environ.get('ROS_DOMAIN_ID', '0')}"
         )
 
     def publish_xy(self, x, y):
@@ -115,11 +97,12 @@ class BlockPublisher(Node):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Detect blue block and publish /block_position")
+    parser = argparse.ArgumentParser()
     parser.add_argument("--camera", type=int, default=0)
-    parser.add_argument("--color", choices=sorted(COLOR_HSV.keys()), default="blue")
+    parser.add_argument("--color", choices=["blue"], default="blue")
     parser.add_argument("--min-area", type=int, default=MIN_AREA_PX)
-    parser.add_argument("--once", action="store_true")
+    parser.add_argument("--stream", action="store_true",
+                        help="keep publishing forever (debug). Default is one-shot handoff.")
     parser.add_argument("--rate", type=float, default=10.0)
     parser.add_argument("--width", type=int, default=CAM_WIDTH)
     parser.add_argument("--height", type=int, default=CAM_HEIGHT)
@@ -132,71 +115,53 @@ def main():
 
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
-    actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     print(
-        f"Camera {args.camera}: {actual_w}x{actual_h}, color={args.color}, "
-        f"ROS_DOMAIN_ID={os.environ.get('ROS_DOMAIN_ID', '0')}, "
-        f"HSV blue lo={lo.tolist()} hi={hi.tolist()}"
+        f"Camera {args.camera} | color=blue | "
+        f"mode={'STREAM' if args.stream else 'ONE-SHOT handoff'} | "
+        f"ROS_DOMAIN_ID={os.environ.get('ROS_DOMAIN_ID', '0')}"
     )
-    if abs(actual_w - args.width) > 40 or abs(actual_h - args.height) > 40:
-        print(
-            f"WARNING: requested {args.width}x{args.height} but got {actual_w}x{actual_h}; "
-            f"homography may be off"
-        )
-    print("Place the blue block in view. Expect 'PUB /block_position' lines. Press q to quit.")
+    print("Start pick_flow in the other terminal. Press q to quit.")
 
     rclpy.init()
     node = BlockPublisher()
-    time.sleep(1.0)  # DDS advertise before first publish
+    time.sleep(1.0)
     period = 1.0 / max(args.rate, 0.1)
-    published = False
     recent = deque(maxlen=SMOOTH_N)
-    last_pub = 0.0
+    bursts_left = HANDOFF_BURSTS
+    handed_off = False
+    last_xy = None
+    last_pub_slow = 0.0
 
     try:
         while rclpy.ok():
             ret, frame = cap.read()
             if not ret:
-                print("Failed to capture frame")
                 break
 
             result = detect_block(frame, color=args.color, min_area=args.min_area)
+            display = frame.copy()
+
             if result is None:
-                display = frame.copy()
-                dbg = color_mask(frame, "blue")
-                preview = cv2.cvtColor(dbg, cv2.COLOR_GRAY2BGR)
-                scale = 200 / max(preview.shape[1], 1)
-                preview = cv2.resize(
-                    preview, (int(preview.shape[1] * scale), int(preview.shape[0] * scale))
-                )
-                display[0:preview.shape[0], 0:preview.shape[1]] = preview
-                cv2.putText(
-                    display, "no blue block — check mask (top-left)",
-                    (10, preview.shape[0] + 24),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2,
-                )
+                recent.clear()
+                status = "no blue block"
+                if handed_off and last_xy is not None and not args.stream:
+                    if time.time() - last_pub_slow >= 1.0:
+                        node.publish_xy(last_xy[0], last_xy[1])
+                        last_pub_slow = time.time()
+                    status = "HANDOFF DONE — re-PUB locked pose (1 Hz)"
             else:
                 cx, cy, area, contour, mask = result
                 recent.append((cx, cy))
                 sx = sum(p[0] for p in recent) / len(recent)
                 sy = sum(p[1] for p in recent) / len(recent)
-                x, y = pixel_to_table(sx, sy)
+                x, y = pixel_to_meters(sx, sy)
+                last_xy = (x, y)
 
-                now = time.time()
-                if now - last_pub >= 0.2:
-                    node.publish_xy(x, y)
-                    last_pub = now
-                    published = True
-
-                display = frame.copy()
                 cv2.drawContours(display, [contour], -1, DRAW_COLOR, 2)
                 cv2.circle(display, (int(sx), int(sy)), 10, (0, 255, 0), -1)
-                cv2.circle(display, (int(sx), int(sy)), 14, (0, 255, 0), 2)
                 cv2.putText(
-                    display,
-                    f"blue ({x:.3f}, {y:.3f}) m  area={int(area)}",
-                    (int(sx) + 14, int(sy) - 14),
+                    display, f"blue ({x:.3f},{y:.3f})m",
+                    (int(sx) + 12, int(sy) - 12),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2,
                 )
                 preview = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
@@ -206,13 +171,47 @@ def main():
                 )
                 display[0:preview.shape[0], 0:preview.shape[1]] = preview
 
+                stable = len(recent) >= SMOOTH_N
+                if args.stream:
+                    node.publish_xy(x, y)
+                    status = "STREAM publishing"
+                elif not handed_off and stable:
+                    node.publish_xy(x, y)
+                    bursts_left -= 1
+                    status = f"handoff burst {HANDOFF_BURSTS - bursts_left}/{HANDOFF_BURSTS}"
+                    if bursts_left <= 0:
+                        handed_off = True
+                        print(
+                            f"HANDOFF DONE x={x:.3f} y={y:.3f} — "
+                            f"frozen pose will re-PUB every 1s until pick_flow takes it. "
+                            f"Start pick_flow if it is not already waiting.",
+                            flush=True,
+                        )
+                        status = "HANDOFF DONE — slow re-PUB"
+                        last_pub_slow = time.time()
+                elif handed_off:
+                    # Keep offering the same locked pose so late pick_flow still receives it
+                    if time.time() - last_pub_slow >= 1.0:
+                        node.publish_xy(last_xy[0], last_xy[1])
+                        last_pub_slow = time.time()
+                    status = "HANDOFF DONE — re-PUB locked pose (1 Hz)"
+                else:
+                    status = f"locking... {len(recent)}/{SMOOTH_N}"
+
+            if last_xy and handed_off and not args.stream:
+                cv2.putText(
+                    display, "LOCKED — re-PUB 1Hz for pick_flow",
+                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2,
+                )
+            cv2.putText(
+                display, status, (10, display.shape[0] - 16),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2,
+            )
+
             cv2.imshow("cam_to_coord", display)
             if (cv2.waitKey(1) & 0xFF) == ord("q"):
                 break
-
             rclpy.spin_once(node, timeout_sec=0.0)
-            if args.once and published and len(recent) >= 2:
-                break
             time.sleep(period)
     finally:
         cap.release()

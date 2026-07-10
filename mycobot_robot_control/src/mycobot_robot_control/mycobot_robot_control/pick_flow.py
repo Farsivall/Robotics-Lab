@@ -18,7 +18,7 @@ import rclpy
 from geometry_msgs.msg import PointStamped
 from mycobot_client_2.ik import CobotIK
 from mycobot_msgs_2.msg import MycobotAngles, MycobotSetAngles
-from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+from rclpy.qos import QoSProfile, ReliabilityPolicy
 
 a = sys.argv[1:]
 USE_VISION = len(a) < 2
@@ -39,21 +39,23 @@ SSH = ['/usr/bin/sshpass', '-p', 'Elephant', 'ssh', '-o', 'StrictHostKeyChecking
        '-o', 'PreferredAuthentications=password', '-o', 'PubkeyAuthentication=no', 'er@' + RIP]
 if GV < 25: print('GRIP_VAL < 25 risks stall-current brownout'); raise SystemExit(2)
 
-# Must match cam_to_coord.py so late subscribe still gets last detection
-BLOCK_QOS = QoSProfile(
-    depth=10,
-    reliability=ReliabilityPolicy.RELIABLE,
-    durability=DurabilityPolicy.TRANSIENT_LOCAL,
-)
+# Match cam_to_coord (volatile reliable). First message unlocks motion.
+BLOCK_QOS = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE)
 
 rclpy.init(); node = CobotIK(visualize=False)
 real = {'a': None}
 target = {'x': None, 'y': None}
+_vision_got = {'n': 0}
 
 def block_callback(msg):
+    # Keep updating until vision_step freezes the pose
+    if target.get('locked'):
+        return
     target['x'] = msg.point.x
     target['y'] = msg.point.y
-    print(f"  (got /block_position x={msg.point.x:.3f} y={msg.point.y:.3f})", flush=True)
+    _vision_got['n'] += 1
+    if _vision_got['n'] == 1:
+        print(f"  got /block_position x={msg.point.x:.3f} y={msg.point.y:.3f}", flush=True)
 
 node.create_subscription(MycobotAngles, '/mycobot/angles_real',
     lambda m: real.__setitem__('a', np.array([m.joint_1, m.joint_2, m.joint_3, m.joint_4, m.joint_5, m.joint_6], float)), 10)
@@ -101,41 +103,45 @@ def grip(v, sp):
     if fresh(20) is None: print('grip: comms did not come back'); return False
     return True
 
-def wait_for_vision(timeout=120.0):
+def wait_for_vision(timeout=60.0):
     print('waiting for /block_position from vision...')
-    print('  tip: other terminal must show lines like: PUB /block_position  x=... y=...')
-    print(f'  tip: both terminals need ROS_DOMAIN_ID={os.environ.get("ROS_DOMAIN_ID", "0")}')
+    print('  tip: cam_to_coord should print PUB then HANDOFF DONE')
+    print(f'  tip: both need ROS_DOMAIN_ID={os.environ.get("ROS_DOMAIN_ID", "0")}')
     t0 = time.time()
     last_hb = t0
     while target['x'] is None:
         rclpy.spin_once(node, timeout_sec=0.1)
         now = time.time()
         if now - last_hb >= 3.0:
-            print(f'  still waiting... {now - t0:.0f}s (is cam_to_coord publishing?)', flush=True)
+            print(f'  still waiting... {now - t0:.0f}s', flush=True)
             last_hb = now
         if now - t0 > timeout:
-            print('vision: TIMEOUT waiting for /block_position')
+            print('vision: TIMEOUT — is cam_to_coord running with same ROS_DOMAIN_ID?')
             return None, None
-    px, py = target['x'], target['y']
-    print(f'vision: block at PX={px:.3f} PY={py:.3f}')
+    settle_end = time.time() + 0.5
+    while time.time() < settle_end:
+        rclpy.spin_once(node, timeout_sec=0.05)
+    px, py = float(target['x']), float(target['y'])
+    print(f'vision: LOCKED PX={px:.3f} PY={py:.3f} — starting arm motion')
     return px, py
 
 def approach_pick():
-    # coords already resolved in 'vision' step when USE_VISION
     px, py = (PX, PY) if not USE_VISION else (target['x'], target['y'])
     if px is None or py is None:
         print('approach: no target coords')
         return False
-    return approach(px, py, GZ + APPR)
+    return approach(float(px), float(py), GZ + APPR)
 
 def approach(x, y, z):
+    print(f'approach: target x={x:.3f} y={y:.3f} z={z:.3f}')
     ik = node.calculate_ik(np.array([x, y, z]), DOWN, 'gripper', 1e-5, 0.3, 0.02, False, 4000, False)
     if ik is None: print('approach: IK None'); return False
     adj = np.array(node.adjust_angles(np.array(ik)), float)
     pos, eul = node.get_pose(adj * DEG, 'gripper')
     err = float(np.linalg.norm(pos - [x, y, z]))
     if err > 0.02 or not np.all(np.abs(adj) <= LIMS):
-        print(f'approach: REFUSED (err {err*1000:.0f}mm)'); return False
+        print(f'approach: REFUSED (err {err*1000:.0f}mm) — coords may be out of reach')
+        return False
     ok = goto(adj, SP)
     print(f'approach: {"OK" if ok else "TIMEOUT"} err={err*1000:.1f}mm'); return ok
 
@@ -180,15 +186,16 @@ def rotate(delta):
     print('rotate: OK'); return True
 
 def vision_step():
-    """Get block pose first (before moving) so hang is obvious and DDS can connect."""
+    """Get block pose once, freeze it, then run the arm sequence."""
     if not USE_VISION:
         print(f'vision: using CLI PX={PX} PY={PY}')
+        target['locked'] = True
         return True
     px, py = wait_for_vision()
     if px is None:
         return False
-    # freeze coords for the rest of the cycle (ignore later vision jitter)
     target['x'], target['y'] = px, py
+    target['locked'] = True
     return True
 
 steps = [
