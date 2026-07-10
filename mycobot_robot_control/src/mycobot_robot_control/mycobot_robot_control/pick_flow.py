@@ -18,7 +18,6 @@ import shutil
 import subprocess
 import sys
 import time
-from pathlib import Path
 
 # RoboEnv IK dependency (needed even if shell forgot to export PYTHONPATH)
 _ROBO = os.path.expanduser("~/RoboEnv/simulation_and_control")
@@ -35,11 +34,6 @@ from mycobot_client_2.ik import CobotIK
 from mycobot_msgs_2.msg import MycobotAngles, MycobotSetAngles
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 
-# Same grip_set.py that hybrid_pick_place.sh / test_robot.sh use on the Pi
-_GRIP_SET_LOCAL = Path(__file__).resolve().parents[1] / "provision" / "grip_set.py"
-if not _GRIP_SET_LOCAL.is_file():
-    _GRIP_SET_LOCAL = Path(__file__).resolve().parents[2] / "provision" / "grip_set.py"
-
 DEG = np.pi / 180.0
 RAD = 180.0 / np.pi
 LIMS = np.array([165, 165, 165, 165, 165, 179.0])
@@ -48,6 +42,9 @@ LIFT = 0.10
 APPR = 0.04
 STEP = 0.01
 BLOCK_QOS = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE)
+# Hardcoded claw values (hybrid_pick_place.sh style)
+GRIP_OPEN = 100
+GRIP_CLOSE = 28
 
 
 def parse_args(argv=None):
@@ -72,54 +69,26 @@ def parse_args(argv=None):
     return p.parse_args(argv)
 
 
-def run_pick(px, py, rot=90.0, grasp_z=0.02, place_z=0.06, grip_val=28, speed=25,
+def run_pick(px, py, rot=90.0, grasp_z=0.02, place_z=0.06, grip_val=None, speed=25,
              use_vision=False, robot_ip=None):
     """Run one full pick-place cycle. Pass px/py OR use_vision=True.
 
-    grip_val: 100=fully open, lower=more closed. Keep >= 25 to avoid Pi brownout.
+    Grip is hardcoded: open=100, close=28 (grip_val ignored).
     """
-    if grip_val < 25:
-        print("GRIP_VAL < 25 risks stall-current brownout")
-        raise SystemExit(2)
-    print(f"grip_val={grip_val} (100=open, lower=tighter)")
+    print(f"grip hardcoded: open={GRIP_OPEN} close={GRIP_CLOSE}")
 
     rip = robot_ip or os.environ.get("ROBOT_IP", "192.168.123.50")
-    # hybrid_pick_place.sh puts miniforge on PATH so sshpass is found
     _mf = os.path.expanduser("~/miniforge3/bin")
     if os.path.isdir(_mf):
         os.environ["PATH"] = _mf + os.pathsep + os.environ.get("PATH", "")
     sshpass = shutil.which("sshpass") or "/usr/bin/sshpass"
-    # Exact same SSH options as hybrid_pick_place.sh / test_robot.sh
-    ssh_opts = [
+    ssh = [
+        sshpass, "-p", "Elephant", "ssh",
         "-o", "StrictHostKeyChecking=no",
         "-o", "PreferredAuthentications=password",
         "-o", "PubkeyAuthentication=no",
+        "er@" + rip,
     ]
-    ssh = [sshpass, "-p", "Elephant", "ssh"] + ssh_opts + ["er@" + rip]
-    scp = [sshpass, "-p", "Elephant", "scp"] + ssh_opts
-    grip_ready = {"ok": False}
-
-    def ensure_grip_script():
-        """Copy provision/grip_set.py to the Pi (same as test_robot.sh)."""
-        if grip_ready["ok"]:
-            return True
-        if not _GRIP_SET_LOCAL.is_file():
-            print(f"grip: WARNING local grip_set.py missing at {_GRIP_SET_LOCAL}")
-            return True
-        print(f"grip: copying {_GRIP_SET_LOCAL.name} -> er@{rip}:/home/er/grip_set.py")
-        try:
-            r = subprocess.run(
-                scp + [str(_GRIP_SET_LOCAL), f"er@{rip}:/home/er/grip_set.py"],
-                capture_output=True, text=True, timeout=30,
-            )
-        except FileNotFoundError:
-            print(f"grip: FAILED — sshpass not found ({sshpass}). sudo apt install sshpass")
-            return False
-        if r.returncode != 0:
-            print("grip: FAILED scp grip_set.py:", (r.stderr or r.stdout or "").strip())
-            return False
-        grip_ready["ok"] = True
-        return True
 
     if not rclpy.ok():
         rclpy.init()
@@ -190,77 +159,26 @@ def run_pick(px, py, rot=90.0, grasp_z=0.02, place_z=0.06, grip_val=28, speed=25
         print("home:", "OK" if ok else "TIMEOUT")
         return ok
 
+    # Hardcoded open/close — same remote command as hybrid_pick_place.sh
     def grip(v, sp):
-        """Open/close claw — same remote action as hybrid_pick_place.sh grip().
-
-        hybrid does:
-          ssh ... "docker stop; python3 /home/er/grip_set.py V SP; docker start"
-          sleep 5
-
-        Values (pymycobot set_gripper_value):
-          100 = fully OPEN
-          ~28 = partial CLOSE (hold block; keep >= 25)
-        """
-        if not ensure_grip_script():
-            return False
-        action = "OPEN" if v >= 90 else "CLOSE"
-        print(f"grip: {action}  value={v} speed={sp}  via er@{rip} grip_set.py")
-        # Preserve grip_set.py exit code (hybrid ignored it; we need it to know
-        # the claw actually ran). docker start still always runs.
+        print(f"grip: set {v} speed {sp}")
         sh = (
-            f"echo 'grip->{v} boot='$(uptime -s); "
             f"docker stop -t 2 mycobot_comms>/dev/null 2>&1; "
-            f"python3 /home/er/grip_set.py {v} {sp}; rc=$?; "
-            f"echo 'boot_after='$(uptime -s); "
-            f"docker start mycobot_comms>/dev/null 2>&1; "
-            f"exit $rc"
+            f"python3 /home/er/grip_set.py {v} {sp}; "
+            f"docker start mycobot_comms>/dev/null 2>&1"
         )
         try:
             r = subprocess.run(ssh + [sh], capture_output=True, text=True, timeout=90)
-        except FileNotFoundError:
-            print(f"grip: FAILED — sshpass not found ({sshpass}). sudo apt install sshpass")
+            if r.stdout:
+                print(r.stdout.strip())
+            if r.stderr:
+                print(r.stderr.strip())
+        except Exception as e:
+            print(f"grip: SSH error: {e}")
             return False
-        except subprocess.TimeoutExpired:
-            print("grip: FAILED — SSH timed out (check ROBOT_IP / Pi network)")
-            return False
-
-        # hybrid merges stderr (2>&1) and drops Permission denied / Warning
-        out = ((r.stdout or "") + "\n" + (r.stderr or "")).strip()
-        for line in out.splitlines():
-            if "Permission denied" in line or "Warning:" in line:
-                continue
-            if line.strip():
-                print(" ", line)
-
-        # Must see grip_set.py prints — not just our echo 'grip->...'
-        if "grip before:" not in out and "grip set->" not in out:
-            print("grip: FAILED — grip_set.py did not run (claw will not move)")
-            print(f"  tip: export ROBOT_IP=<pi-ip>  (current ROBOT_IP={rip})")
-            print("  tip: ./test_robot.sh   # copies grip_set.py and tests open/close")
-            return False
-        if r.returncode != 0:
-            print(f"grip: FAILED grip_set.py exit={r.returncode} ROBOT_IP={rip}")
-            return False
-
-        boots = [l.split("=", 1)[1] for l in out.splitlines() if "boot" in l and "=" in l]
-        if len(boots) >= 2 and boots[0] != boots[-1]:
-            print("grip: PI REBOOTED during grip (value too tight?)")
-            return False
-
-        # hybrid always sleeps 5s here so the claw finishes + docker is back
         time.sleep(5)
-        if fresh(25) is None:
-            print("grip: WARNING angles not back yet after docker start — continuing")
-        print(f"grip: OK {action} -> {v}")
+        fresh(20)
         return True
-
-    def open_gripper():
-        """Fully open claw (hybrid: grip 100 40)."""
-        return grip(100, 40)
-
-    def close_gripper():
-        """Partial-close claw to hold the block (hybrid: grip $GV 15)."""
-        return grip(grip_val, 15)
 
     def wait_for_vision(timeout=60.0):
         print("waiting for /block_position from vision...")
@@ -376,21 +294,18 @@ def run_pick(px, py, rot=90.0, grasp_z=0.02, place_z=0.06, grip_val=28, speed=25
     def approach_pick():
         return approach(float(target["x"]), float(target["y"]), grasp_z + APPR)
 
-    # Same open/close sequence as hybrid_pick_place.sh:
-    #   open  -> grip 100 40
-    #   grip  -> grip $GV 15
-    #   release -> grip 100 40
+    # Hardcoded grip: open=100, close=28 (same as hybrid_pick_place.sh)
     steps = [
         ("vision", vision_step),
         ("home", lambda: home()),
-        ("open", open_gripper),
+        ("open", lambda: grip(GRIP_OPEN, 40)),
         ("approach", approach_pick),
         ("descend", lambda: move_z(grasp_z, 15)),
-        ("grip", close_gripper),
+        ("grip", lambda: grip(GRIP_CLOSE, 15)),
         ("lift", lambda: move_z(LIFT, speed)),
         ("rotate", lambda: rotate(rot)),
         ("place-descend", lambda: move_z(place_z, speed)),
-        ("release", open_gripper),
+        ("release", lambda: grip(GRIP_OPEN, 40)),
         ("retreat", lambda: move_z(0.12, speed)),
         ("home-end", lambda: home()),
     ]
@@ -420,10 +335,6 @@ def main(argv=None):
         px = args.px if args.px is not None else 0.18
         py = args.py if args.py is not None else 0.0
 
-    # Prefer --grip-val / --grasp-z flags; else positional; else defaults
-    grip = args.grip_val_opt if args.grip_val_opt is not None else (
-        args.grip_val if args.grip_val is not None else int(os.environ.get("GRIP_VAL", "28"))
-    )
     gz = args.grasp_z_opt if args.grasp_z_opt is not None else args.grasp_z
 
     run_pick(
@@ -432,7 +343,6 @@ def main(argv=None):
         rot=args.rot,
         grasp_z=gz,
         place_z=args.place_z,
-        grip_val=grip,
         speed=args.speed,
         use_vision=use_vision,
     )
