@@ -1,19 +1,16 @@
 #!/usr/bin/env python3
-"""Color-driven pick + base-rotate + place, WITH in-process vision.
+"""Preset pick + place with color-detection UI overlay.
 
-Mimics the original pick_flow.py motion exactly (home -> open -> approach ->
-descend -> partial close -> lift -> rotate J1 -> place descend -> open ->
-retreat -> home) but you tell it WHICH color to grab. The webcam detects that
-color (tracking visuals on), then the arm goes to the hardcoded pick position
-for that color and runs the pick.
+Camera shows color tracking (blue / yellow / purple) for the demo UI, then
+the arm ALWAYS runs the original pick_flow motion to a hardcoded pick and
+place — detection does not gate the motion (color sorting comes later).
 
-Sequence: vision(detect chosen color) -> home -> open -> approach -> descend ->
-          partial close -> lift -> rotate J1 -> place descend -> open ->
-          retreat -> home.
+Sequence: vision(show detection briefly) -> home -> open -> approach ->
+          descend -> partial close -> lift -> rotate J1 -> place descend ->
+          open -> retreat -> home.
 
-Usage: python pick_flow_vision.py [COLOR] [ROT]
-       COLOR = blue | yellow | purple   (which block to find + pick; default blue)
-       ROT   = base rotate degrees for the place side (default 90)
+Usage: python pick_flow_vision.py [ROT]
+       ROT = base rotate degrees for the place side (default 90)
 Env:   ROBOT_IP     overrides target robot (default 192.168.123.50)
        CAMERA_INDEX overrides cv2.VideoCapture index (default 0)
 """
@@ -29,17 +26,23 @@ from mycobot_msgs_2.msg import MycobotAngles, MycobotSetAngles
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-# --- unit note: pick_flow's arm math is in METERS (PX=0.18 etc). If your
-# homography_transform only exposes pixel_to_cm, we convert cm -> m below.
-# CONFIRM pixel_to_cm actually returns centimeters, or targets will be 100x off.
-from homography_transform import pixel_to_meters as _pixel_to_table
-
 _args = sys.argv[1:]
-TARGET_COLOR = _args[0].lower() if len(_args) > 0 else 'blue'
-ROT = float(_args[1]) if len(_args) > 1 else 90.0
+# Optional: first arg can still be a color (ignored for motion) or ROT degrees
+ROT = 90.0
+if len(_args) >= 1:
+    if _args[0].lower() in ("blue", "yellow", "purple"):
+        # color arg kept for UI preference only; motion still uses preset
+        UI_COLOR_PREF = _args[0].lower()
+        if len(_args) >= 2:
+            ROT = float(_args[1])
+    else:
+        UI_COLOR_PREF = "auto"
+        ROT = float(_args[0])
+else:
+    UI_COLOR_PREF = "auto"
+
 GZ = 0.02
 PZ = 0.06
-GV = 28
 SP = 25
 
 DEG = np.pi / 180.0; RAD = 180.0 / np.pi
@@ -65,13 +68,17 @@ GRIP_CLOSE = 28
 print(f'grip hardcoded: open={GRIP_OPEN} close={GRIP_CLOSE}')
 
 # ---------------------------------------------------------------------------
-# Vision (formerly cam_to_coord.py) -- pure OpenCV, no ROS involved.
+# Preset pick / place (motion always uses these — color sorting later)
 # ---------------------------------------------------------------------------
+# base-frame METERS: x forward, y left
+PRESET_PICK = (0.18, 0.00)   # known-good front-center
+# place is: lift -> rotate ROT -> descend to PZ (same as original pick_flow)
+
 CAM_WIDTH = 1280
 CAM_HEIGHT = 720
 CAMERA_INDEX = int(os.environ.get('CAMERA_INDEX', 0))
+PREVIEW_SEC = 4.0  # show detection UI this long, then always start the pick
 
-# Color midpoints (RGB) — same values as cam_to_coord.py
 COLOR_RGB = {
     'blue':   (33, 52, 100),
     'purple': (67, 41, 65),
@@ -95,146 +102,123 @@ for _name, _rgb in COLOR_RGB.items():
     COLOR_HSV[_name] = (_lo, _hi)
     DRAW_BY_COLOR[_name] = _draw
 
-# HARDCODED pick position per color, base-frame METERS (x forward, y left).
-# The camera confirms/tracks the chosen color; the arm goes to these coords.
-# EDIT to match where each block actually sits.
-PICK_POSITIONS = {
-    'blue':   (0.18,  0.00),
-    'yellow': (0.18, -0.06),
-    'purple': (0.18,  0.06),
-}
-
-if TARGET_COLOR not in COLOR_HSV:
-    print(f"unknown color '{TARGET_COLOR}'. Use one of: {', '.join(COLOR_HSV)}")
-    raise SystemExit(2)
-HSV_LO, HSV_HI = COLOR_HSV[TARGET_COLOR]
-DRAW_COLOR = DRAW_BY_COLOR[TARGET_COLOR]
-PX, PY = PICK_POSITIONS[TARGET_COLOR]
-print(f"target color: {TARGET_COLOR} -> hardcoded pick ({PX:.3f}, {PY:.3f}) m")
-
 MIN_AREA_PX = 200
-SMOOTH_N = 3          # frames to average
-STABLE_N = 5          # consecutive good detections required before accepting
-VISION_TIMEOUT = 60.0
+SMOOTH_N = 3
+
+print(f"preset pick ({PRESET_PICK[0]:.3f}, {PRESET_PICK[1]:.3f}) m | rotate={ROT} | UI color={UI_COLOR_PREF}")
 
 
-def _color_mask(frame_bgr):
+def _color_mask(frame_bgr, color):
+    lo, hi = COLOR_HSV[color]
     hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
     hsv = cv2.GaussianBlur(hsv, (5, 5), 0)
-    mask = cv2.inRange(hsv, HSV_LO, HSV_HI)
+    mask = cv2.inRange(hsv, lo, hi)
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
     return mask
 
 
-def _detect_block(frame, min_area=MIN_AREA_PX):
-    mask = _color_mask(frame)
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return None
-    contour = max(contours, key=cv2.contourArea)
-    area = float(cv2.contourArea(contour))
-    if area < min_area:
-        return None
-    M = cv2.moments(contour)
-    if M["m00"] == 0:
-        return None
-    cx = M["m10"] / M["m00"]
-    cy = M["m01"] / M["m00"]
-    return cx, cy, area, contour, mask
+def _detect_any(frame, prefer=None, min_area=MIN_AREA_PX):
+    """Return best blob among colors (prefer optional). (cx,cy,area,contour,mask,name) or None."""
+    order = list(COLOR_HSV.keys())
+    if prefer in COLOR_HSV:
+        order = [prefer] + [c for c in order if c != prefer]
+    best = None
+    for name in order:
+        mask = _color_mask(frame, name)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            continue
+        contour = max(contours, key=cv2.contourArea)
+        area = float(cv2.contourArea(contour))
+        if area < min_area:
+            continue
+        M = cv2.moments(contour)
+        if M["m00"] == 0:
+            continue
+        cx = M["m10"] / M["m00"]
+        cy = M["m01"] / M["m00"]
+        if best is None or area > best[2]:
+            best = (cx, cy, area, contour, mask, name)
+    return best
 
 
-def capture_block_xy(timeout=VISION_TIMEOUT, show=True):
-    """Blocking webcam capture -> smoothed pixel centroid -> table coords.
-
-    Requires STABLE_N consecutive good detections (after SMOOTH_N-frame
-    smoothing) before accepting, to avoid firing on a single noisy frame.
-    Returns (x, y) in meters, or (None, None) on timeout/camera failure.
-    """
+def show_detection_preview(seconds=PREVIEW_SEC):
+    """Show color tracking in the UI, then return. Never blocks the pick."""
     cap = cv2.VideoCapture(CAMERA_INDEX)
     if not cap.isOpened():
-        print(f"vision: failed to open camera {CAMERA_INDEX}")
-        return None, None
-
+        print(f"vision: camera {CAMERA_INDEX} not available — skipping UI, starting pick anyway")
+        return
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAM_WIDTH)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_HEIGHT)
-    actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    print(f"vision: camera {CAMERA_INDEX} {actual_w}x{actual_h}, waiting for {TARGET_COLOR} block "
-          f"(need {STABLE_N} stable frames, timeout {timeout:.0f}s, 'q' to abort)")
-
+    print(f"vision: showing color detection for {seconds:.0f}s (then preset pick starts). Press q to skip.")
     recent = deque(maxlen=SMOOTH_N)
-    stable_count = 0
     t0 = time.time()
-    result_xy = (None, None)
-
+    last_seen = None
     try:
-        while time.time() - t0 < timeout:
+        while time.time() - t0 < seconds:
             ret, frame = cap.read()
             if not ret:
-                print("vision: failed to capture frame")
                 break
-
-            det = _detect_block(frame)
             display = frame.copy()
-
+            prefer = UI_COLOR_PREF if UI_COLOR_PREF != "auto" else None
+            det = _detect_any(frame, prefer=prefer)
             if det is None:
-                stable_count = 0
                 recent.clear()
-                if show:
-                    dbg = cv2.cvtColor(_color_mask(frame), cv2.COLOR_GRAY2BGR)
-                    scale = 200 / max(dbg.shape[1], 1)
-                    dbg = cv2.resize(dbg, (int(dbg.shape[1] * scale), int(dbg.shape[0] * scale)))
-                    display[0:dbg.shape[0], 0:dbg.shape[1]] = dbg
-                    cv2.putText(display, f"no {TARGET_COLOR} block", (10, dbg.shape[0] + 24),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                dbg = _color_mask(frame, prefer or "blue")
+                preview = cv2.cvtColor(dbg, cv2.COLOR_GRAY2BGR)
+                scale = 200 / max(preview.shape[1], 1)
+                preview = cv2.resize(preview, (int(preview.shape[1] * scale), int(preview.shape[0] * scale)))
+                display[0:preview.shape[0], 0:preview.shape[1]] = preview
+                cv2.putText(display, "detecting... (pick will run anyway)",
+                            (10, preview.shape[0] + 24),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2)
             else:
-                cx, cy, area, contour, mask = det
+                cx, cy, area, contour, mask, name = det
                 recent.append((cx, cy))
-                stable_count += 1
                 sx = sum(p[0] for p in recent) / len(recent)
                 sy = sum(p[1] for p in recent) / len(recent)
-                x, y = _pixel_to_table(sx, sy)
+                last_seen = name
+                draw = DRAW_BY_COLOR[name]
+                cv2.drawContours(display, [contour], -1, draw, 2)
+                cv2.circle(display, (int(sx), int(sy)), 10, (0, 255, 0), -1)
+                cv2.putText(display,
+                            f"{name} seen | preset pick ({PRESET_PICK[0]:.2f},{PRESET_PICK[1]:.2f})",
+                            (int(sx) + 14, int(sy) - 14),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
+                preview = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+                scale = 200 / max(preview.shape[1], 1)
+                preview = cv2.resize(preview, (int(preview.shape[1] * scale), int(preview.shape[0] * scale)))
+                display[0:preview.shape[0], 0:preview.shape[1]] = preview
 
-                if show:
-                    cv2.drawContours(display, [contour], -1, DRAW_COLOR, 2)
-                    cv2.circle(display, (int(sx), int(sy)), 10, (0, 255, 0), -1)
-                    cv2.putText(display,
-                                f"{TARGET_COLOR} -> pick ({PX:.3f},{PY:.3f})m  n={stable_count}/{STABLE_N}",
-                                (int(sx) + 14, int(sy) - 14),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-
-                if stable_count >= STABLE_N:
-                    result_xy = (x, y)
-                    print(f"vision: {TARGET_COLOR} locked (mapped x={x:.3f} y={y:.3f} m)")
-                    break
-
-            if show:
-                cv2.imshow("pick_flow vision", display)
-                if (cv2.waitKey(1) & 0xFF) == ord("q"):
-                    print("vision: aborted by user")
-                    break
+            left = max(0.0, seconds - (time.time() - t0))
+            cv2.putText(display, f"starting pick in {left:.1f}s",
+                        (10, display.shape[0] - 16),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
+            cv2.imshow("pick_flow vision", display)
+            if (cv2.waitKey(1) & 0xFF) == ord("q"):
+                print("vision: preview skipped")
+                break
     finally:
         cap.release()
-        if show:
-            cv2.destroyAllWindows()
-
-    if result_xy == (None, None):
-        print("vision: TIMEOUT / no stable detection")
-    return result_xy
+        cv2.destroyAllWindows()
+    if last_seen:
+        print(f"vision: last saw {last_seen} (UI only — motion uses preset pick)")
+    else:
+        print("vision: no color locked (UI only — motion uses preset pick anyway)")
 
 
 # ---------------------------------------------------------------------------
-# Arm control (unchanged from pick_flow.py, minus the /block_position topic)
+# Arm control — same as original Summer School pick_flow.py
 # ---------------------------------------------------------------------------
 rclpy.init(); node = CobotIK(visualize=False)
 real = {'a': None}
-target = {'x': None, 'y': None}
+target = {'x': PRESET_PICK[0], 'y': PRESET_PICK[1]}
 
 node.create_subscription(MycobotAngles, '/mycobot/angles_real',
     lambda m: real.__setitem__('a', np.array([m.joint_1, m.joint_2, m.joint_3, m.joint_4, m.joint_5, m.joint_6], float)), 10)
-print(f"pick_flow ready | color={TARGET_COLOR} | ROS_DOMAIN_ID={os.environ.get('ROS_DOMAIN_ID', '0')}")
+print(f"pick_flow ready | preset pick={PRESET_PICK} | ROS_DOMAIN_ID={os.environ.get('ROS_DOMAIN_ID', '0')}")
 
 def fresh(t=4.0):
     real['a'] = None; t0 = time.time()
@@ -264,7 +248,6 @@ def home(speed=30):
     print('home:', 'OK' if ok else 'TIMEOUT'); return ok
 
 def ensure_grip_script():
-    """Copy provision/grip_set.py to the Pi so the claw script is present."""
     if _grip_ready['ok']:
         return True
     if not _GRIP_SET_LOCAL.is_file():
@@ -289,7 +272,6 @@ def ensure_grip_script():
     return True
 
 def grip(v, sp):
-    """Hardcoded open/close via SSH + grip_set.py (hybrid_pick_place style)."""
     action = 'OPEN' if v >= 90 else 'CLOSE'
     print(f'grip: {action} value={v} speed={sp} via er@{RIP}')
     if not ensure_grip_script():
@@ -314,51 +296,23 @@ def grip(v, sp):
     if 'grip before:' not in out and 'grip set->' not in out:
         print('grip: FAILED — grip_set.py produced no output (claw did NOT move)')
         print(f'  check: ROBOT_IP={RIP}, Pi reachable, /home/er/grip_set.py exists')
-        print('  from laptop:  ./test_robot.sh')
         return False
     time.sleep(5)
     fresh(20)
     print(f'grip: OK {action} -> {v}')
     return True
 
-def approach_pick():
-    if target['x'] is None or target['y'] is None:
-        print('approach: no target coords')
-        return False
-    return approach(target['x'], target['y'], GZ + APPR)
-
-def solve_ik(x, y, z):
-    """Best IK for (x,y,z): try current-pose seed (lets off-center targets
-    solve) then zero seed (accurate near the front-center default)."""
-    cur = fresh(4)
-    attempts = []
-    if cur is not None:
-        attempts.append(('current-seed', cur * DEG, True))
-    attempts.append(('zero-seed', np.zeros(6), False))
-    best = None
-    for label, seed, use_seed in attempts:
-        node.real_angles = seed
-        ik = node.calculate_ik(np.array([x, y, z]), DOWN, 'gripper', 1e-5, 0.3, 0.02, use_seed, 4000, False)
-        if ik is None:
-            continue
-        adj = np.array(node.adjust_angles(np.array(ik)), float)
-        pos, _eul = node.get_pose(adj * DEG, 'gripper')
-        err = float(np.linalg.norm(pos - [x, y, z]))
-        if not np.all(np.abs(adj) <= LIMS):
-            continue
-        if best is None or err < best[1]:
-            best = (adj, err, label)
-    return best
-
 def approach(x, y, z):
-    best = solve_ik(x, y, z)
-    if best is None:
-        print('approach: IK None (no in-limit solution from any seed)'); return False
-    adj, err, label = best
-    if err > 0.02:
-        print(f'approach: REFUSED (err {err*1000:.0f}mm, {label})'); return False
+    # Original Summer School approach: zero-seed IK (works at preset front-center)
+    ik = node.calculate_ik(np.array([x, y, z]), DOWN, 'gripper', 1e-5, 0.3, 0.02, False, 4000, False)
+    if ik is None: print('approach: IK None'); return False
+    adj = np.array(node.adjust_angles(np.array(ik)), float)
+    pos, eul = node.get_pose(adj * DEG, 'gripper')
+    err = float(np.linalg.norm(pos - [x, y, z]))
+    if err > 0.02 or not np.all(np.abs(adj) <= LIMS):
+        print(f'approach: REFUSED (err {err*1000:.0f}mm)'); return False
     ok = goto(adj, SP)
-    print(f'approach: {"OK" if ok else "TIMEOUT"} err={err*1000:.1f}mm ({label})'); return ok
+    print(f'approach: {"OK" if ok else "TIMEOUT"} err={err*1000:.1f}mm'); return ok
 
 def move_z(tz, speed):
     b = fresh(6)
@@ -401,16 +355,16 @@ def rotate(delta):
     print('rotate: OK'); return True
 
 def vision_step():
-    """Detect the chosen color with the webcam BEFORE moving the arm, then
-    pick at that color's HARDCODED position."""
-    mx, my = capture_block_xy()
-    if mx is None:
-        return False
-    target['x'], target['y'] = PX, PY
-    print(f"vision: {TARGET_COLOR} detected (mapped {mx:.3f},{my:.3f}) "
-          f"-> using hardcoded pick ({PX:.3f},{PY:.3f})")
+    """UI-only color detection, then always use the preset pick."""
+    show_detection_preview(PREVIEW_SEC)
+    target['x'], target['y'] = PRESET_PICK
+    print(f"vision: starting preset pick ({PRESET_PICK[0]:.3f}, {PRESET_PICK[1]:.3f})")
     return True
 
+def approach_pick():
+    return approach(float(target['x']), float(target['y']), GZ + APPR)
+
+# Same step list as original Summer School pick_flow.py (+ brief vision UI)
 steps = [
     ('vision',        vision_step),
     ('home',          lambda: home()),
