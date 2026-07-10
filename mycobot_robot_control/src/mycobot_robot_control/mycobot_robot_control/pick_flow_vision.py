@@ -49,12 +49,56 @@ DEG = np.pi / 180.0; RAD = 180.0 / np.pi
 LIMS = np.array([165, 165, 165, 165, 165, 179.0])
 DOWN = np.array([180.0, 0.0, 0.0])
 LIFT = 0.10; APPR = 0.04; STEP = 0.01
-RIP = os.environ.get('ROBOT_IP', '192.168.123.50')
+
+
+def discover_robot_ip():
+    """Find a reachable Pi IP (same idea as pick_vision.sh / test_robot.sh)."""
+    env = os.environ.get('ROBOT_IP', '').strip()
+    if env:
+        return env
+    cands = []
+    try:
+        neigh = subprocess.run(['ip', 'neigh', 'show'], capture_output=True, text=True, timeout=5)
+        for line in (neigh.stdout or '').splitlines():
+            parts = line.split()
+            if parts and parts[0].startswith('192.168.123.'):
+                cands.append(parts[0])
+    except Exception:
+        pass
+    for tip in ('192.168.123.50', '10.10.10.235'):
+        cands.append(tip)
+    # unique, keep order
+    seen, uniq = set(), []
+    for ip in cands:
+        if ip not in seen:
+            seen.add(ip); uniq.append(ip)
+    reachable = []
+    for ip in uniq:
+        try:
+            r = subprocess.run(['ping', '-c1', '-W1', ip], capture_output=True, timeout=3)
+            if r.returncode == 0:
+                reachable.append(ip)
+        except Exception:
+            pass
+    if len(reachable) == 1:
+        print(f'== robot auto-discovered: {reachable[0]} ==')
+        return reachable[0]
+    if len(reachable) > 1:
+        print(f'Multiple robots reachable: {reachable}. Set ROBOT_IP=<one> and re-run.')
+        raise SystemExit(2)
+    print('No robot found on 192.168.123.x / 10.10.10.235.')
+    print('  Check Ethernet to the Pi, wait ~30s after power-on, then:')
+    print('  export ROBOT_IP=<pi-ip>   # find with: ip neigh | grep 192.168.123')
+    raise SystemExit(2)
+
+
+RIP = discover_robot_ip()
 _mf = os.path.expanduser('~/miniforge3/bin')
 if os.path.isdir(_mf):
     os.environ['PATH'] = _mf + os.pathsep + os.environ.get('PATH', '')
 SSHPASS = shutil.which('sshpass') or '/usr/bin/sshpass'
 _OPTS = ['-o', 'StrictHostKeyChecking=no',
+         '-o', 'ConnectTimeout=5',
          '-o', 'PreferredAuthentications=password',
          '-o', 'PubkeyAuthentication=no']
 SSH = [SSHPASS, '-p', 'Elephant', 'ssh'] + _OPTS + ['er@' + RIP]
@@ -65,7 +109,7 @@ if not _GRIP_SET_LOCAL.is_file():
 _grip_ready = {'ok': False}
 GRIP_OPEN = 100
 GRIP_CLOSE = 28
-print(f'grip hardcoded: open={GRIP_OPEN} close={GRIP_CLOSE}')
+print(f'grip hardcoded: open={GRIP_OPEN} close={GRIP_CLOSE} | ROBOT_IP={RIP}')
 
 # ---------------------------------------------------------------------------
 # Preset pick / place (motion always uses these — color sorting later)
@@ -266,7 +310,12 @@ def ensure_grip_script():
         print(f'grip: FAILED — scp timed out (check ROBOT_IP={RIP} / network)')
         return False
     if r.returncode != 0:
-        print('grip: FAILED to copy grip_set.py:', (r.stderr or r.stdout or '').strip())
+        err = (r.stderr or r.stdout or '').strip()
+        print('grip: FAILED to copy grip_set.py:', err)
+        if 'No route to host' in err or 'Connection timed out' in err or 'Connection refused' in err:
+            print(f'  Pi not reachable at ROBOT_IP={RIP}.')
+            print('  Fix:  export ROBOT_IP=<real-pi-ip>')
+            print('  Find: ip neigh | grep 192.168.123   OR   ./test_robot.sh')
         return False
     _grip_ready['ok'] = True
     return True
