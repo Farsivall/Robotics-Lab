@@ -164,7 +164,7 @@ def main():
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
     print(
-        f"Camera {args.camera} | blue | "
+        f"Camera {args.camera} | color={args.color} | "
         f"mode={'PICK' if args.pick else 'TWO-TERMINAL publish'} | "
         f"ROS_DOMAIN_ID={os.environ.get('ROS_DOMAIN_ID', '0')}"
     )
