@@ -33,23 +33,31 @@ from homography_transform import pixel_to_meters
 CAM_WIDTH = 1280
 CAM_HEIGHT = 720
 
-# Blue HSV from measured midpoint RGB=(33, 52, 100) — friend's calibration
-MID_RGB = (33, 52, 100)
-_mid_bgr = np.uint8([[[MID_RGB[2], MID_RGB[1], MID_RGB[0]]]])
-_mid_hsv = cv2.cvtColor(_mid_bgr, cv2.COLOR_BGR2HSV)[0, 0]
-H, S, V = int(_mid_hsv[0]), int(_mid_hsv[1]), int(_mid_hsv[2])
+def convert_to_hsv(Rvalue, Gvalue, Bvalue):
+    _mid_bgr = np.uint8([[[Bvalue, Gvalue, Rvalue]]])
+    _mid_hsv = cv2.cvtColor(_mid_bgr, cv2.COLOR_BGR2HSV)[0, 0]
+    H, S, V = int(_mid_hsv[0]), int(_mid_hsv[1]), int(_mid_hsv[2])
 
-H_TOL = 12
-S_TOL = 70
-V_TOL = 70
+    H_TOL = 12
+    S_TOL = 70
+    V_TOL = 70
 
-lo = np.array([max(0, H - H_TOL), max(40, S - S_TOL), max(30, V - V_TOL)])
-hi = np.array([min(179, H + H_TOL), 255, min(255, V + V_TOL)])
-COLOR_HSV = {
-    "blue": [(lo, hi)],
-}
-DRAW_COLOR = (int(_mid_bgr[0, 0, 0]), int(_mid_bgr[0, 0, 1]), int(_mid_bgr[0, 0, 2]))
+    lo = np.array([max(0, H - H_TOL), max(40, S - S_TOL), max(30, V - V_TOL)])
+    hi = np.array([min(179, H + H_TOL), 255, min(255, V + V_TOL)])
+    draw_color = (int(_mid_bgr[0, 0, 0]), int(_mid_bgr[0, 0, 1]), int(_mid_bgr[0, 0, 2]))
+    return lo, hi, draw_color
 
+
+blue_rgb = (33, 52, 100)
+purple_rgb = (67, 41, 65)
+yellow_rgb = (249, 222, 0)
+
+COLOR_HSV = {}
+DRAW_COLOR = {}
+for name, rgb in [("blue", blue_rgb), ("purple", purple_rgb), ("yellow", yellow_rgb)]:
+    lo, hi, draw = convert_to_hsv(*rgb)
+    COLOR_HSV[name] = [(lo, hi)]
+    DRAW_COLOR[name] = draw
 MIN_AREA_PX = 200
 SMOOTH_N = 3
 
@@ -73,22 +81,31 @@ def color_mask(frame_bgr, color="blue"):
     return mask
 
 
-def detect_block(frame, color="blue", min_area=MIN_AREA_PX):
-    mask = color_mask(frame, color=color)
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return None
-    contour = max(contours, key=cv2.contourArea)
-    area = float(cv2.contourArea(contour))
-    if area < min_area:
-        return None
-    M = cv2.moments(contour)
-    if M["m00"] == 0:
-        return None
-    cx = M["m10"] / M["m00"]
-    cy = M["m01"] / M["m00"]
-    return cx, cy, area, contour, mask
+def detect_block(frame, color="auto", min_area=MIN_AREA_PX):
+    colors_to_check = COLOR_HSV.keys() if color == "auto" else [color]
 
+    best = None
+    for name in colors_to_check:
+        mask = color_mask(frame, color=name)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            continue
+
+        contour = max(contours, key=cv2.contourArea)
+        area = float(cv2.contourArea(contour))
+        if area < min_area:
+            continue
+
+        M = cv2.moments(contour)
+        if M["m00"] == 0:
+            continue
+        cx = M["m10"] / M["m00"]
+        cy = M["m01"] / M["m00"]
+
+        if best is None or area > best[2]:
+            best = (cx, cy, area, contour, mask, name)
+
+    return best
 
 def pixel_to_table(cx, cy):
     return pixel_to_meters(cx, cy)
@@ -115,9 +132,9 @@ class BlockPublisher(Node):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Detect blue block and publish /block_position")
+    parser = argparse.ArgumentParser(description="Detect block and publish /block_position")
     parser.add_argument("--camera", type=int, default=0)
-    parser.add_argument("--color", choices=sorted(COLOR_HSV.keys()), default="blue")
+    parser.add_argument("--color", choices=["auto"] + sorted(COLOR_HSV.keys()), default="auto")
     parser.add_argument("--min-area", type=int, default=MIN_AREA_PX)
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--rate", type=float, default=10.0)
@@ -164,7 +181,8 @@ def main():
             result = detect_block(frame, color=args.color, min_area=args.min_area)
             if result is None:
                 display = frame.copy()
-                dbg = color_mask(frame, "blue")
+                debug_color = args.color if args.color != "auto" else "blue"
+                dbg = color_mask(frame, debug_color)
                 preview = cv2.cvtColor(dbg, cv2.COLOR_GRAY2BGR)
                 scale = 200 / max(preview.shape[1], 1)
                 preview = cv2.resize(
@@ -177,7 +195,7 @@ def main():
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2,
                 )
             else:
-                cx, cy, area, contour, mask = result
+                cx, cy, area, contour, mask , found_colour = result
                 recent.append((cx, cy))
                 sx = sum(p[0] for p in recent) / len(recent)
                 sy = sum(p[1] for p in recent) / len(recent)
@@ -190,12 +208,12 @@ def main():
                     published = True
 
                 display = frame.copy()
-                cv2.drawContours(display, [contour], -1, DRAW_COLOR, 2)
+                cv2.drawContours(display, [contour], -1, DRAW_COLOR[found_colour], 2)
                 cv2.circle(display, (int(sx), int(sy)), 10, (0, 255, 0), -1)
                 cv2.circle(display, (int(sx), int(sy)), 14, (0, 255, 0), 2)
                 cv2.putText(
                     display,
-                    f"blue ({x:.3f}, {y:.3f}) m  area={int(area)}",
+                    f" {found_colour}({x:.3f}, {y:.3f}) m  area={int(area)}",
                     (int(sx) + 14, int(sy) - 14),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2,
                 )
