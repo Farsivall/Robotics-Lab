@@ -63,6 +63,18 @@ MIN_AREA_PX = 200
 SMOOTH_N = 3
 BLOCK_QOS = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE)
 
+# ---------------------------------------------------------------------------
+# HARDCODED pick positions per color, base-frame METERS (x forward, y left).
+# The camera is still used to SEE which color block is present (tracking
+# visuals stay on), but the arm is sent to these fixed coords, not the
+# homography-mapped point. EDIT these to match where each block actually sits.
+# ---------------------------------------------------------------------------
+PICK_POSITIONS = {
+    "blue":   (0.18,  0.00),
+    "yellow": (0.18, -0.06),
+    "purple": (0.18,  0.06),
+}
+
 
 def color_mask(frame_bgr, color="blue"):
     hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
@@ -215,13 +227,16 @@ def main():
                 recent.append((cx, cy))
                 sx = sum(p[0] for p in recent) / len(recent)
                 sy = sum(p[1] for p in recent) / len(recent)
-                x, y = pixel_to_meters(sx, sy)
+                # Tracking visuals still use the live pixel centroid, but the
+                # arm is sent to the HARDCODED position for this color.
+                mx, my = pixel_to_meters(sx, sy)  # shown for reference only
+                px, py = PICK_POSITIONS.get(found_colour, (mx, my))
                 draw = DRAW_COLOR.get(found_colour, (0, 255, 0))
 
                 cv2.drawContours(display, [contour], -1, draw, 2)
                 cv2.circle(display, (int(sx), int(sy)), 10, (0, 255, 0), -1)
                 cv2.putText(
-                    display, f"{found_colour} ({x:.3f},{y:.3f})m",
+                    display, f"{found_colour} -> pick ({px:.3f},{py:.3f})m",
                     (int(sx) + 12, int(sy) - 12),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2,
                 )
@@ -235,18 +250,18 @@ def main():
                 stable = len(recent) >= SMOOTH_N
                 if args.pick and stable and not pick_started:
                     pick_started = True
-                    print(f"LOCKED x={x:.3f} y={y:.3f} — launching pick_flow", flush=True)
+                    print(f"LOCKED {found_colour} -> hardcoded x={px:.3f} y={py:.3f} — launching pick_flow", flush=True)
                     cap.release()
                     cv2.destroyAllWindows()
-                    ok = run_pick_flow(x, y, rot=args.rot, grip_val=args.grip_val, dry_run=args.dry_run)
+                    ok = run_pick_flow(px, py, rot=args.rot, grip_val=args.grip_val, dry_run=args.dry_run)
                     print("pick_flow:", "OK" if ok else "FAILED")
                     raise SystemExit(0 if ok else 1)
 
                 if not args.pick and stable and node is not None:
-                    node.publish_xy(x, y)
-                    status = "PUBLISHING"
+                    node.publish_xy(px, py)
+                    status = f"PUBLISHING {found_colour} -> ({px:.3f},{py:.3f})"
                 else:
-                    status = f"locking... {len(recent)}/{SMOOTH_N}"
+                    status = f"locking {found_colour}... {len(recent)}/{SMOOTH_N}"
 
             cv2.putText(
                 display, status, (10, display.shape[0] - 16),
