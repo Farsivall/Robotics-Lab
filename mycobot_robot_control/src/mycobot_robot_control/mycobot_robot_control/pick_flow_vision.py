@@ -1,24 +1,37 @@
 #!/usr/bin/env python3
-"""One-shot pick + base-rotate + place orchestrator. Single ROS node (init paid
-once), gripper via SSH -> Pi-host pymycobot partial close (no docker spin-up,
-avoids the gripper-current brownout). Fail-fast: any step failure aborts, arm
-holds position.
+"""One-shot pick + base-rotate + place orchestrator, WITH in-process vision.
 
-Sequence: home -> open -> approach -> descend -> partial close -> lift ->
-          rotate J1 -> place descend -> open -> retreat -> home.
+Combines cam_to_coord.py (blue-block detection) directly into pick_flow.py:
+the webcam is opened and read inside vision_step(), a smoothed pixel centroid
+is converted to table coords via homography, and that's fed straight into
+approach_pick(). No /block_position ROS topic, no second terminal, no DDS
+discovery race.
+
+Sequence: vision -> home -> open -> approach -> descend -> partial close ->
+          lift -> rotate J1 -> place descend -> open -> retreat -> home.
 
 Usage: python pick_flow.py [PX PY ROT [GRASP_Z PLACE_Z GRIP_VAL SPEED]]
        defaults: 0.18 0 90 0.02 0.06 35 25
-       omit PX/PY to wait for /block_position (geometry_msgs/PointStamped) from vision
-Env:   ROBOT_IP overrides target robot (default 192.168.123.50)
+       omit PX/PY to use the webcam instead (default behavior)
+Env:   ROBOT_IP     overrides target robot (default 192.168.123.50)
+       CAMERA_INDEX overrides cv2.VideoCapture index (default 0)
 """
 import os, subprocess, sys, time
+from collections import deque
+from pathlib import Path
+
+import cv2
 import numpy as np
 import rclpy
-from geometry_msgs.msg import PointStamped
 from mycobot_client_2.ik import CobotIK
 from mycobot_msgs_2.msg import MycobotAngles, MycobotSetAngles
-from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+# --- unit note: pick_flow's arm math is in METERS (PX=0.18 etc). If your
+# homography_transform only exposes pixel_to_cm, we convert cm -> m below.
+# CONFIRM pixel_to_cm actually returns centimeters, or targets will be 100x off.
+from homography_transform import pixel_to_meters as _pixel_to_table
 
 a = sys.argv[1:]
 USE_VISION = len(a) < 2
@@ -39,25 +52,143 @@ SSH = ['/usr/bin/sshpass', '-p', 'Elephant', 'ssh', '-o', 'StrictHostKeyChecking
        '-o', 'PreferredAuthentications=password', '-o', 'PubkeyAuthentication=no', 'er@' + RIP]
 if GV < 25: print('GRIP_VAL < 25 risks stall-current brownout'); raise SystemExit(2)
 
-# Must match cam_to_coord.py so late subscribe still gets last detection
-BLOCK_QOS = QoSProfile(
-    depth=10,
-    reliability=ReliabilityPolicy.RELIABLE,
-    durability=DurabilityPolicy.TRANSIENT_LOCAL,
-)
+# ---------------------------------------------------------------------------
+# Vision (formerly cam_to_coord.py) -- pure OpenCV, no ROS involved.
+# ---------------------------------------------------------------------------
+CAM_WIDTH = 1280
+CAM_HEIGHT = 720
+CAMERA_INDEX = int(os.environ.get('CAMERA_INDEX', 0))
 
+MID_RGB = (33, 52, 100)  # blue calibration midpoint
+_mid_bgr = np.uint8([[[MID_RGB[2], MID_RGB[1], MID_RGB[0]]]])
+_mid_hsv = cv2.cvtColor(_mid_bgr, cv2.COLOR_BGR2HSV)[0, 0]
+H, S, V = int(_mid_hsv[0]), int(_mid_hsv[1]), int(_mid_hsv[2])
+H_TOL, S_TOL, V_TOL = 12, 70, 70
+HSV_LO = np.array([max(0, H - H_TOL), max(40, S - S_TOL), max(30, V - V_TOL)])
+HSV_HI = np.array([min(179, H + H_TOL), 255, min(255, V + V_TOL)])
+DRAW_COLOR = (int(_mid_bgr[0, 0, 0]), int(_mid_bgr[0, 0, 1]), int(_mid_bgr[0, 0, 2]))
+
+MIN_AREA_PX = 200
+SMOOTH_N = 3          # frames to average
+STABLE_N = 5          # consecutive good detections required before accepting
+VISION_TIMEOUT = 60.0
+
+
+def _color_mask(frame_bgr):
+    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+    hsv = cv2.GaussianBlur(hsv, (5, 5), 0)
+    mask = cv2.inRange(hsv, HSV_LO, HSV_HI)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    return mask
+
+
+def _detect_block(frame, min_area=MIN_AREA_PX):
+    mask = _color_mask(frame)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+    contour = max(contours, key=cv2.contourArea)
+    area = float(cv2.contourArea(contour))
+    if area < min_area:
+        return None
+    M = cv2.moments(contour)
+    if M["m00"] == 0:
+        return None
+    cx = M["m10"] / M["m00"]
+    cy = M["m01"] / M["m00"]
+    return cx, cy, area, contour, mask
+
+
+def capture_block_xy(timeout=VISION_TIMEOUT, show=True):
+    """Blocking webcam capture -> smoothed pixel centroid -> table coords.
+
+    Requires STABLE_N consecutive good detections (after SMOOTH_N-frame
+    smoothing) before accepting, to avoid firing on a single noisy frame.
+    Returns (x, y) in meters, or (None, None) on timeout/camera failure.
+    """
+    cap = cv2.VideoCapture(CAMERA_INDEX)
+    if not cap.isOpened():
+        print(f"vision: failed to open camera {CAMERA_INDEX}")
+        return None, None
+
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAM_WIDTH)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_HEIGHT)
+    actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    print(f"vision: camera {CAMERA_INDEX} {actual_w}x{actual_h}, waiting for blue block "
+          f"(need {STABLE_N} stable frames, timeout {timeout:.0f}s, 'q' to abort)")
+
+    recent = deque(maxlen=SMOOTH_N)
+    stable_count = 0
+    t0 = time.time()
+    result_xy = (None, None)
+
+    try:
+        while time.time() - t0 < timeout:
+            ret, frame = cap.read()
+            if not ret:
+                print("vision: failed to capture frame")
+                break
+
+            det = _detect_block(frame)
+            display = frame.copy()
+
+            if det is None:
+                stable_count = 0
+                recent.clear()
+                if show:
+                    dbg = cv2.cvtColor(_color_mask(frame), cv2.COLOR_GRAY2BGR)
+                    scale = 200 / max(dbg.shape[1], 1)
+                    dbg = cv2.resize(dbg, (int(dbg.shape[1] * scale), int(dbg.shape[0] * scale)))
+                    display[0:dbg.shape[0], 0:dbg.shape[1]] = dbg
+                    cv2.putText(display, "no blue block", (10, dbg.shape[0] + 24),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+            else:
+                cx, cy, area, contour, mask = det
+                recent.append((cx, cy))
+                stable_count += 1
+                sx = sum(p[0] for p in recent) / len(recent)
+                sy = sum(p[1] for p in recent) / len(recent)
+                x, y = _pixel_to_table(sx, sy)
+
+                if show:
+                    cv2.drawContours(display, [contour], -1, DRAW_COLOR, 2)
+                    cv2.circle(display, (int(sx), int(sy)), 10, (0, 255, 0), -1)
+                    cv2.putText(display, f"({x:.3f},{y:.3f}) m  n={stable_count}/{STABLE_N}",
+                                (int(sx) + 14, int(sy) - 14),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+                if stable_count >= STABLE_N:
+                    result_xy = (x, y)
+                    print(f"vision: locked block at x={x:.3f} y={y:.3f} (m)")
+                    break
+
+            if show:
+                cv2.imshow("pick_flow vision", display)
+                if (cv2.waitKey(1) & 0xFF) == ord("q"):
+                    print("vision: aborted by user")
+                    break
+    finally:
+        cap.release()
+        if show:
+            cv2.destroyAllWindows()
+
+    if result_xy == (None, None):
+        print("vision: TIMEOUT / no stable detection")
+    return result_xy
+
+
+# ---------------------------------------------------------------------------
+# Arm control (unchanged from pick_flow.py, minus the /block_position topic)
+# ---------------------------------------------------------------------------
 rclpy.init(); node = CobotIK(visualize=False)
 real = {'a': None}
 target = {'x': None, 'y': None}
 
-def block_callback(msg):
-    target['x'] = msg.point.x
-    target['y'] = msg.point.y
-    print(f"  (got /block_position x={msg.point.x:.3f} y={msg.point.y:.3f})", flush=True)
-
 node.create_subscription(MycobotAngles, '/mycobot/angles_real',
     lambda m: real.__setitem__('a', np.array([m.joint_1, m.joint_2, m.joint_3, m.joint_4, m.joint_5, m.joint_6], float)), 10)
-node.create_subscription(PointStamped, '/block_position', block_callback, BLOCK_QOS)
 print(f"pick_flow ready | vision={USE_VISION} | ROS_DOMAIN_ID={os.environ.get('ROS_DOMAIN_ID', '0')}")
 
 def fresh(t=4.0):
@@ -73,8 +204,6 @@ def cmd(deg6, speed):
     m.speed = speed; node.cmd_angle_pub.publish(m)
 
 def goto(deg6, speed, tol=3.5, timeout=14.0):
-    # Resend the goal each poll: after a comms restart the first publish can be
-    # lost while DDS pub/sub discovery is still completing. ~0.7 Hz is gentle.
     t0 = time.time()
     while time.time() - t0 < timeout:
         cmd(deg6, speed)
@@ -101,29 +230,7 @@ def grip(v, sp):
     if fresh(20) is None: print('grip: comms did not come back'); return False
     return True
 
-'''
-def wait_for_vision(timeout=120.0):
-    print('waiting for /block_position from vision...')
-    print('  tip: other terminal must show lines like: PUB /block_position  x=... y=...')
-    print(f'  tip: both terminals need ROS_DOMAIN_ID={os.environ.get("ROS_DOMAIN_ID", "0")}')
-    t0 = time.time()
-    last_hb = t0
-    while target['x'] is None:
-        rclpy.spin_once(node, timeout_sec=0.1)
-        now = time.time()
-        if now - last_hb >= 3.0:
-            print(f'  still waiting... {now - t0:.0f}s (is cam_to_coord publishing?)', flush=True)
-            last_hb = now
-        if now - t0 > timeout:
-            print('vision: TIMEOUT waiting for /block_position')
-            return None, None
-    px, py = target['x'], target['y']
-    print(f'vision: block at PX={px:.3f} PY={py:.3f}')
-    return px, py
-'''
-
 def approach_pick():
-    # coords already resolved in 'vision' step when USE_VISION
     px, py = (PX, PY) if not USE_VISION else (target['x'], target['y'])
     if px is None or py is None:
         print('approach: no target coords')
@@ -182,19 +289,18 @@ def rotate(delta):
     print('rotate: OK'); return True
 
 def vision_step():
-    """Get block pose first (before moving) so hang is obvious and DDS can connect."""
+    """Grab block pose from the webcam BEFORE moving the arm."""
     if not USE_VISION:
         print(f'vision: using CLI PX={PX} PY={PY}')
         return True
-    px, py = ()
+    px, py = capture_block_xy()
     if px is None:
         return False
-    # freeze coords for the rest of the cycle (ignore later vision jitter)
     target['x'], target['y'] = px, py
     return True
 
 steps = [
-    ('vision',        vision_step),   # wait for camera BEFORE moving the arm
+    ('vision',        vision_step),
     ('home',          lambda: home()),
     ('open',          lambda: grip(100, 40)),
     ('approach',      approach_pick),

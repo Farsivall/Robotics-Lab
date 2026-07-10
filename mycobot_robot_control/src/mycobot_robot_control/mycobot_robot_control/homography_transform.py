@@ -22,16 +22,14 @@ import cv2
 # ---------------------------------------------------------------------------
 # Original coordinates in cm (robot / world frame)
 CM_POINTS = np.array([
-    (-15.5, 24), (4, 25), (-24, 16), (-5, 17), (12, 19),
-    (-15.5, 9), (4.5, 9), (19.5, 9), (-5, 5), (-24, -1),
-    (0, 0), (12.5, 0), (27.5, 0)
+    (-16, 0), (0, 0), (16, 0), (-6, 7.5), (8, 8),
+    (-16, 13.5), (0, 15), (16, 15), (-9, 20), (9, 20),
 ], dtype=np.float64)
 
 # Corresponding transformed coordinates in px (camera / image frame)
 PX_POINTS = np.array([
-    (1039, 618), (450, 647), (1174, 484), (701, 531), (274, 527),
-    (900, 407), (496, 409), (178, 406), (679, 374), (1006, 332),
-    (600, 332), (371, 339), (115, 334)
+    (945, 310), (647, 321), (352, 314), (791, 401),(467, 408),
+    (1051, 471), (647, 511), (223, 513), (384, 633), (933, 603),
 ], dtype=np.float64)
 
 # Homography: pixel -> cm (swap src/dst if you need cm -> px instead)
@@ -50,7 +48,7 @@ def pixel_to_cm(x_px, y_px):
 def pixel_to_meters(x_px, y_px):
     """Pixel -> (x_forward_m, y_lateral_m) for pick_flow /block_position."""
     lateral_cm, forward_cm = pixel_to_cm(x_px, y_px)
-    return forward_cm / 100.0, lateral_cm / 100.0
+    return lateral_cm / 100.0, forward_cm / 100.0
 
 
 if __name__ == '__main__':
